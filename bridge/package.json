@@ -1,7 +1,8 @@
 {
   "name": "gemini-web-bridge",
-  "version": "0.1.0",
-  "description": "Reverse proxy for gemini.google.com web UI, exposing an OpenAI-compatible local endpoint with account-protection guards",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reverse proxy for gemini.google.com web UI, exposing an OpenAI-compatible local endpoint with account-protection guards. Vendored inside dsh-gemini-bridge; not published standalone.",
   "type": "module",
   "scripts": {
     "login": "node bin/login.mjs",

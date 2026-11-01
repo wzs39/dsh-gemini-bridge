@@ -1,18 +1,28 @@
 /**
- * Mount the Gemini web bridge into DSH as an OpenAI-compatible provider.
+ * Mount the Gemini web bridge into DSH as an OpenAI-compatible provider
+ * (STANDALONE path -- for running bridge/ without the dsh-gemini-bridge plugin).
  *
- * Same trick as deepseek-web-bridge/bin/mount-dsh.mjs: mint the harness's
- * signed browser-session cookie locally (HMAC with the secret already in
- * .credentials.yaml) and POST through the plugin's own /providers route, so
- * the durable settings file AND the live catalog both update without a restart.
+ * When installed via the plugin, lib/index.js registers provider
+ * `gemini-bridge` with process hosting automatically -- you do NOT need this
+ * script, and mounting a second row here only duplicates the picker entries.
+ * Use this ONLY for the git-clone-standalone workflow:
+ *   git clone && node bridge/bin/serve.mjs   (separate terminal)
+ *   node bridge/bin/mount-dsh.mjs
  *
- * Pick a provider row whose baseUrl is overridable and whose auth kind carries
- * a Bearer key. Use --provider=<id> to choose; --show lists the current rows.
+ * Mechanism: the harness gates its own plugin API behind a signed browser
+ * cookie. That cookie is an HMAC over a base64url payload keyed by the secret
+ * already stored in `.credentials.yaml`, so this script mints one instead of
+ * driving a browser. Posting through the plugin's own `/providers` route
+ * matters: that handler rewrites the durable settings file *and* rebuilds the
+ * live provider catalog, so no application restart is needed.
+ *
  * WARNING: saving a provider row overwrites that row -- do not point this at
- * the same row the deepseek bridge already owns.
+ * the same row another bridge (e.g. deepseek-web-bridge) already owns.
  *
  * Usage:
- *   node bin/mount-dsh.mjs [--provider=<id>] [--model=gemini-web] [--show] [--remove]
+ *   node bin/mount-dsh.mjs [--provider=<id>] [--show] [--remove]
+ *   The model list is discovered live from the running bridge's /v1/models
+ *   (web channel + agy catalog), so newly added models need no script change.
  */
 
 import fs from 'node:fs'
@@ -91,24 +101,43 @@ if (process.argv.includes('--show')) {
   process.exit(0)
 }
 
-const PROVIDER_ID = flag('provider', 'gemini')
-const MODEL_ID = flag('model', 'gemini-web')
+const PROVIDER_ID = flag('provider', 'gemini-standalone')
 
 if (process.argv.includes('--remove')) {
   const result = await api(base, cookie, 'POST', `${REGISTRY}/remove`, { providerId: PROVIDER_ID })
   console.log(`remove ${PROVIDER_ID}: ${result.status}`)
+  console.log(JSON.stringify(result.payload, null, 2))
   process.exit(result.status === 200 ? 0 : 1)
 }
 
 const bridge = process.env.BRIDGE_URL ?? 'http://127.0.0.1:18901/v1'
+const key = process.env.BRIDGE_KEY ?? 'sk-local-gemini-web'
+
+// Discover the live catalog from the running bridge (web + agy models) instead
+// of hardcoding one entry: the agy channel adds models without a script edit.
+let modelIds = []
+try {
+  const listing = await fetch(`${bridge}/models`, {
+    headers: { authorization: `Bearer ${key}`, accept: 'application/json' },
+    signal: AbortSignal.timeout(8000),
+  })
+  if (listing.ok) {
+    const body = await listing.json()
+    modelIds = (body?.data ?? [])
+      .map((m) => m?.id)
+      .filter((id) => typeof id === 'string' && id !== '')
+  }
+} catch { /* bridge not up yet; fall through to the single default model */ }
+if (modelIds.length === 0) modelIds = ['gemini-web']
+
 const saved = await api(base, cookie, 'POST', REGISTRY, {
   providerId: PROVIDER_ID,
   enabled: true,
   baseUrl: bridge,
-  apiKey: process.env.BRIDGE_KEY ?? 'sk-local-gemini-web',
-  models: [MODEL_ID],
+  apiKey: key,
+  models: modelIds,
 })
-console.log(`save ${PROVIDER_ID} -> ${bridge}: ${saved.status}`)
+console.log(`save ${PROVIDER_ID} -> ${bridge} (${modelIds.length} models): ${saved.status}`)
 console.log(JSON.stringify(saved.payload, null, 2))
 if (saved.status !== 200) process.exit(1)
 
@@ -118,5 +147,5 @@ const tested = await api(base, cookie, 'POST', `${REGISTRY}/test`, { providerId:
 console.log(`test ${PROVIDER_ID}: ${tested.status}`)
 console.log(JSON.stringify(tested.payload, null, 2))
 
-console.log(`\nmodel id in the picker: ${PROVIDER_ID}/${MODEL_ID}`)
+console.log(`\nmodels in the picker: ${modelIds.map((id) => `${PROVIDER_ID}/${id}`).join(', ')}`)
 process.exit(0)
