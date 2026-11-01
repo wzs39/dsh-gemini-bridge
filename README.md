@@ -63,6 +63,38 @@ HOME 隔离、冷却与配额）。第二个写入者会和它的调度打架，
 检查池状态：`node bridge/tools/pool-status.mjs`；
 逐模型实测：`node bridge/tools/probe-model-ids.mjs`。
 
+### 两种「地区墙」要分清（实测，别混为一件）
+
+agy CLI 报「not currently available in your location」时，实际可能是两道**完全
+不同**的锁。逐端点探测（`tools/fix-validation.mjs`）就能分辨：
+
+| 症状 | `loadCodeAssist` | `streamGenerateContent` | 真正原因 | 解法 |
+|---|---|---|---|---|
+| CLI 拒绝启动，但生成端点通 | 200，带 `ineligibleTiers: UNSUPPORTED_LOCATION` | **200** | 纯客户端误判 | `agy-unlock` addon 抹掉拒绝字段即可 |
+| CLI 拒绝启动，生成端点也 403 | 200，同样带 `UNSUPPORTED_LOCATION` | **403 `VALIDATION_REQUIRED`** | **Google 账号验证**，与地区无关 | 只能人工过验证 |
+
+**关键判据**：`loadCodeAssist` 的 `ineligibleTiers` 只针对 `free-tier`，而
+`currentTier` 往往已经授予 `standard-tier`——所以它不能作为「地区封禁」的证据。
+真正的判决在生成端点：200 = 有资格（addon 能救）；403 `VALIDATION_REQUIRED` =
+要账号验证（addon 救不了，抹字段只会让 CLI 启动后照样失败）。
+
+第二种情况的处理：
+
+```bash
+node bridge/tools/fix-validation.mjs <账号id或邮箱片段>          # 诊断 + 取验证链接
+node bridge/tools/fix-validation.mjs <账号> --open               # 弹独立 profile 浏览器
+node bridge/tools/fix-validation.mjs <账号> --watch              # 自动等验证生效
+```
+
+- 验证链接形如 `accounts.google.com/v3/signin/continue?...continue=developers.google.com/gemini-code-assist/...`，
+  要**用该账号本人**登录完成（手机/设备确认），这一步无法自动化
+- 浏览器用**该账号独立 profile**（`~/.dsh/agy-unlock/profiles/<id>`）：多个号混用
+  同一个浏览器指纹会被 Google 关联成同一个人，反复触发验证
+- `--watch` 每 15 秒探测一次生成端点，通了立刻退出 0，省掉人工回报
+
+轮转自检：`node bridge/tools/test-rotation.mjs`（park 掉当前账号 → 看流量是否
+切到另一个 → resume 后是否切回）。
+
 ## 安装
 
 ```bash
