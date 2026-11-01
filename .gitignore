@@ -11,3 +11,7 @@ __pycache__/
 bridge/tools/agy-response-dump/
 bridge/tools/*.log
 .git-commit-msg.txt
+
+# Local run artifacts (serve logs, captured streams, verification output).
+# runs/config.verify.json derives from config.json, which holds account config.
+runs/
