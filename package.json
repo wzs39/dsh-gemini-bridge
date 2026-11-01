@@ -16,6 +16,11 @@
   ],
   "type": "module",
   "main": "lib/index.js",
+  "scripts": {
+    "test": "node --test bridge/test/*.test.mjs && node bridge/tools/test-tool-gating.mjs && node bridge/tools/test-brain-routes.mjs && node bridge/tools/test-brain-http.mjs",
+    "test:bridge": "node --test bridge/test/*.test.mjs",
+    "test:plugin": "node bridge/tools/test-tool-gating.mjs && node bridge/tools/test-brain-routes.mjs && node bridge/tools/test-brain-http.mjs"
+  },
   "exports": {
     ".": {
       "default": "./lib/index.js"
@@ -35,6 +40,7 @@
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-ui-slots",
         "@deepseek-ai/dsh-client-ui-settings-plugins",
+        "@deepseek-ai/dsh-client-ui-layout",
         "@deepseek-ai/dsh-client-locale"
       ]
     },
