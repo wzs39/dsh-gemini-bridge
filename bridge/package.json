@@ -8,7 +8,7 @@
     "login": "node bin/login.mjs",
     "serve": "node bin/serve.mjs",
     "verify": "node bin/verify.mjs",
-    "test": "node --test test/manager.test.mjs test/server.test.mjs test/agyconvert.test.mjs test/router.test.mjs test/detect.test.mjs test/guard.test.mjs test/parser.test.mjs"
+    "test": "node --test test/manager.test.mjs test/agyclient.test.mjs test/server.test.mjs test/agyconvert.test.mjs test/router.test.mjs test/detect.test.mjs test/guard.test.mjs test/parser.test.mjs"
   },
   "engines": { "node": ">=22" }
 }

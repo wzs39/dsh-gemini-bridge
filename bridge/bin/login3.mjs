@@ -29,9 +29,15 @@ const timeoutMs = (() => {
 
 console.log(`[login3] ${accounts.length} account(s): ${accounts.map(a => a.name).join(', ')}`)
 
+// --poll-only: never spawn browsers (host may be inside a sandbox whose job
+// object kills detached children). Assumes the operator launches the visible
+// windows externally (tools/open-edge.ps1); we just watch each configured
+// CDP port and harvest the moment a session cookie appears.
+const pollOnly = process.argv.includes('--poll-only')
+
 // 1. Ensure one visible browser per account (own port + own profile dir).
 const children = []
-for (const account of accounts) {
+if (!pollOnly) for (const account of accounts) {
   const { port, executable, userDataDir, args } = account.config.browser
   const live = await fetch(`http://127.0.0.1:${port}/json/version`, {
     signal: AbortSignal.timeout(1000),

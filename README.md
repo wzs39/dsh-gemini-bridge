@@ -30,6 +30,39 @@ DSH 模型选择器
 | 并发 | bridge 串行队列 + 插件闸门（默认 ≤2 并发流）|
 | 多账号 | 每账号独立浏览器 profile/端口/守卫状态；park 自动轮转 |
 
+### agy 多账号池（复用 dsh-agy-link 的账号库）
+
+agy 通道默认**只读消费** `~/.dsh/agy-accounts/pool.json`——那是 dsh-agy-link
+维护的账号池（它管 Windows 凭据槽 `gemini:antigravity` 的租约、per-account
+HOME 隔离、冷却与配额）。第二个写入者会和它的调度打架，所以这边只读：
+
+- 账号来源 = `pool.json` 里 `enabled != false` 且带 `dir` 或 `systemHome` 的条目
+- token 来源 = 各账号目录下的 `.gemini/antigravity-cli/antigravity-oauth-token`
+  （`acc_primary` 走系统 HOME / keyring，和 CLI 一致）
+- 我方写入 = **只有自己**的刷新缓存在 `os.tmpdir()/dsh-gemini-bridge/`
+- 轮转策略 = 粘滞直到失败：命中硬信号才 park 并顺延到下一个，全 park 抛
+  `AgyAllParkedError` 带 retry-after
+
+**实测错误分类**（三条都来自真实流量，不是推断）：
+
+| 上游返回 | 含义 | 处理 |
+|---|---|---|
+| 429 `RESOURCE_EXHAUSTED` | 该身份配额耗尽 | park 1h（throttled）后轮转 |
+| 401 + 刷新失败 | refresh token 死了 | park 12h（auth）后轮转，需人工重登 |
+| **403 `PERMISSION_DENIED`**<br>`Verify your account to continue` | **身份级验证门**：同一模型，一个号 403，另一个号正常 200 | park 12h（auth）后轮转 |
+| **404 `NOT_FOUND`** | 模型 id 不存在 | **立即失败，不轮转**（不是账号问题，轮转会白烧整池） |
+
+两个踩过的坑（都有回归测试 `test/agyclient.test.mjs`）：
+
+1. **SSE 帧分隔符是 CRLF**——上游用 `\r\n\r\n`，只找 `\n\n` 会一帧都切不出来，
+   把健康的 200 误报成 `stream produced no events`。
+2. **模型 id 不能凭记忆写**——`gemini-3.8-flash` 上游 404，真实变体是
+   `-high` / `-medium` / `-low` / `-tiered`（权威清单取自 `pool.json` 的
+   `quotas.*.models[].modelId`）。`gemini-2.5-pro` 是账号门控项，默认不广播。
+
+检查池状态：`node bridge/tools/pool-status.mjs`；
+逐模型实测：`node bridge/tools/probe-model-ids.mjs`。
+
 ## 安装
 
 ```bash

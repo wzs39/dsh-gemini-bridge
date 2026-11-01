@@ -70,7 +70,7 @@ const DEFAULTS = {
   agy: {
     enabled: true,
     project: 'aicode-consumers',
-    defaultModel: 'gemini-3.8-flash',
+    defaultModel: 'gemini-3.8-flash-medium',
     tokenFile: null, // null -> ~/.gemini/antigravity-cli/antigravity-oauth-token
     poolFile: null, // null -> auto: use ~/.dsh/agy-accounts/pool.json when present, else single-account mode
   },

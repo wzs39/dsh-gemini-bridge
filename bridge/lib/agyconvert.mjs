@@ -19,7 +19,15 @@
  * @module gemini-web-bridge/lib/agyconvert
  */
 
-/** Client selector -> [upstream model id, thinkingLevel]. Unknown names pass through unchanged. */
+/**
+ * Client selector -> [upstream model id, thinkingLevel]. Unknown names pass through unchanged.
+ *
+ * The three flash efforts all collapse onto the `-tiered` id with a
+ * thinkingLevel, which is what the CLI does. `gemini-3.8-flash` (no effort
+ * suffix) is kept as a friendly alias for medium -- but note that id is NOT
+ * valid upstream on its own (404), it only works through this mapping.
+ * Direct ids (-high/-medium/-low/-tiered) also pass through unchanged.
+ */
 const MODEL_MAP = {
   'gemini-3.8-flash-low': ['gemini-3.8-flash-tiered', 'LOW'],
   'gemini-3.8-flash': ['gemini-3.8-flash-tiered', 'MEDIUM'],

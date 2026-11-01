@@ -26,7 +26,7 @@
   "agy": {
     "enabled": true,
     "project": "aicode-consumers",
-    "defaultModel": "gemini-3.8-flash",
+    "defaultModel": "gemini-3.8-flash-medium",
     "tokenFile": null,
     "poolFile": null
   },

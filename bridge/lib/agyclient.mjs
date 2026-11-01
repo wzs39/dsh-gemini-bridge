@@ -28,12 +28,30 @@ import { pauseFor } from './detect.mjs'
 const BASE = 'https://daily-cloudcode-pa.googleapis.com'
 const UA = 'antigravity/4.3.0 windows/amd64'
 
-/** Models this build advertises on /v1/models when the agy channel is enabled. */
+/**
+ * Models this build advertises on /v1/models when the agy channel is enabled.
+ *
+ * These ids are the AUTHORITATIVE ones taken from dsh-agy-link's own quota
+ * table in pool.json (quotas.*.models[].modelId) and verified live against a
+ * serving account. Do not hand-write them from memory: "gemini-3.8-flash" is
+ * NOT a valid id (upstream returns 404 NOT_FOUND) -- the real flash variants
+ * are -high / -medium / -low / -tiered.
+ *
+ * gemini-2.5-pro is intentionally absent: it is account-gated (403 "Verify
+ * your account to continue") on this plan while every other gemini id serves.
+ */
 export const AGY_MODELS = [
-  'gemini-3.8-flash-low',
-  'gemini-3.8-flash',
   'gemini-3.8-flash-high',
+  'gemini-3.8-flash-medium',
+  'gemini-3.8-flash-low',
+  'gemini-3.8-flash-tiered',
   'gemini-3-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-flash-thinking',
+  'gemini-3.1-flash-image',
   'claude-sonnet-4-6',
   'claude-opus-4-6-thinking',
   'gpt-oss-120b-medium',
@@ -121,10 +139,28 @@ export class AgyClient {
         const isQuota = err instanceof AgyUpstreamError
           && (err.status === 429 || err.code === 'RESOURCE_EXHAUSTED')
         const isDead = err instanceof AgyUpstreamError && err.status === 401 && err.code === 'DEAD_REFRESH'
-        if (isQuota || isDead) {
-          // Park and rotate. pauseFor('throttled') = 1h for quota; auth-dead
-          // gets the longer auth window (12h) -- a human must re-login.
-          this.#pool.pause(account, pauseFor(isDead ? 'auth_expired' : 'throttled'), err.message)
+        // Account-level gate: "PERMISSION_DENIED / Verify your account to
+        // continue". Verified live: this is PER IDENTITY, not per token and not
+        // per model -- one account returns 403 for every model while a sibling
+        // account serves the same model fine. So it must rotate, not abort.
+        const isGated = err instanceof AgyUpstreamError
+          && (err.status === 403 || err.code === 'PERMISSION_DENIED')
+        // Model id errors are NOT account problems: rotating cannot fix a 404
+        // and would just burn every account in the pool on one bad request.
+        const isModelError = err instanceof AgyUpstreamError
+          && (err.status === 404 || err.code === 'NOT_FOUND')
+
+        if (isModelError) throw err
+
+        if (isQuota || isDead || isGated) {
+          if (isGated) {
+            // Park on the auth window: only a human verifying the account (or
+            // the plan upgrading) clears it. A 1h "throttled" park would make
+            // us retry a permanently gated identity every hour forever.
+            this.#pool.pause(account, pauseFor('auth_expired'), err.message)
+          } else {
+            this.#pool.pause(account, pauseFor(isDead ? 'auth_expired' : 'throttled'), err.message)
+          }
           continue
         }
         throw err
@@ -226,7 +262,12 @@ export class AgyClient {
       if (done) break
       buf += decoder.decode(value, { stream: true })
 
-      // SSE frames separated by blank lines; consume complete ones only.
+      // SSE frames end at a blank line. The upstream emits CRLF blank lines
+      // ("\r\n\r\n") while older proxies emit "\n\n" -- verified live on
+      // daily-cloudcode-pa (CRLF only), so a bare '\n\n' search finds nothing
+      // and a full 200 response gets misread as an empty stream. Normalise
+      // CRLF to LF as data arrives, then one separator check is enough.
+      buf = buf.replace(/\r\n/g, '\n')
       let sep
       while ((sep = buf.indexOf('\n\n')) !== -1) {
         const frame = buf.slice(0, sep)
