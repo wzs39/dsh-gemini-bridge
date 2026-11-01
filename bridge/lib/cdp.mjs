@@ -26,9 +26,24 @@ export function launchBrowser({ executable, userDataDir, port, headless, extraAr
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-sync',
+    // 这三个不是优化项，是**必需项**。
+    //
+    // 老配置用 `--window-position=-32000,-32000` 把窗口挪出屏幕，Chromium 于是
+    // 认为标签页被遮挡/不可见（实测 document.visibilityState === 'hidden'），
+    // 后台节流随即生效：页内 fetch 连同源请求都发不出去，同步 XHR 直接
+    // NetworkError，而 evaluate 依然正常。
+    //
+    // 现象是最难查的那一类：cookie 抓得到、SNlM0e 抓得到、bl 正常、页面
+    // readyState 是 complete，只有真正的 StreamGenerate 一直挂到超时。
+    //
+    // 强制写在基础参数里而不是交给 browser.args，因为漏配一次就是全线卡死。
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-background-timer-throttling',
   ]
   if (headless) args.push('--headless=new')
   if (userDataDir) args.push(`--user-data-dir=${userDataDir}`)
+  // 调用方显式给的参数优先（同名的会覆盖前面的）。
   for (const a of extraArgs) args.push(a)
 
   return spawn(executable ?? 'chrome', args, {
@@ -227,13 +242,30 @@ class CDPSession extends EventEmitter {
 }
 
 /**
- * Attach to the first available page in a running DevTools instance.
+ * Attach to a page in a running DevTools instance.
  *
- * Returns an object with a `.send(method, params)` method and a `.close()`.
+ * Target selection matters more than it looks. `list.find(t => t.type === 'page')`
+ * picks whichever page Chromium happens to list first, and in a real browser
+ * profile that is usually NOT the site you want: measured on a live profile the
+ * first page target was `chrome-extension://…/install.html`. Attaching there
+ * made every token scrape and every generateRaw silently run against an
+ * extension page — cookies and `SNlM0e` scraped fine (the extension page still
+ * shares the profile) while the actual StreamGenerate request went nowhere and
+ * the call hung until timeout.
+ *
+ * So: prefer a page whose URL starts with `preferOrigin`; fall back to the first
+ * page only when nothing matches, so a fresh profile that has not navigated yet
+ * still works.
+ *
+ * @param {number} port
+ * @param {{preferOrigin?: string}} [opts]
  */
-export async function attachFirstPage(port) {
+export async function attachFirstPage(port, opts = {}) {
   const list = await fetch(`http://127.0.0.1:${port}/json`).then(r => r.json())
-  const target = list.find(t => t.type === 'page')
+  const pages = list.filter(t => t.type === 'page' && typeof t.webSocketDebuggerUrl === 'string')
+  const want = typeof opts.preferOrigin === 'string' ? opts.preferOrigin.replace(/\/$/, '') : ''
+  const target = (want ? pages.find(t => String(t.url ?? '').startsWith(want)) : undefined)
+    ?? pages[0]
   if (!target) throw new Error('no page target found in DevTools')
   const wsUrl = target.webSocketDebuggerUrl
   const url = new URL(wsUrl)

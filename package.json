@@ -19,7 +19,8 @@
   "scripts": {
     "test": "node --test bridge/test/*.test.mjs && node bridge/tools/test-tool-gating.mjs && node bridge/tools/test-brain-routes.mjs && node bridge/tools/test-brain-http.mjs",
     "test:bridge": "node --test bridge/test/*.test.mjs",
-    "test:plugin": "node bridge/tools/test-tool-gating.mjs && node bridge/tools/test-brain-routes.mjs && node bridge/tools/test-brain-http.mjs"
+    "test:plugin": "node bridge/tools/test-tool-gating.mjs && node bridge/tools/test-brain-routes.mjs && node bridge/tools/test-brain-http.mjs",
+    "test:host": "node bridge/tools/test-host-routes.mjs"
   },
   "exports": {
     ".": {

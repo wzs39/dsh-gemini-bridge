@@ -10,7 +10,10 @@
     "headless": false,
     "port": 9334,
     "args": [
-      "--window-position=-32000,-32000"
+      "--window-position=-32000,-32000",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+      "--disable-background-timer-throttling"
     ],
     "userDataDir": null
   },

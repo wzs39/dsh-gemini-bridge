@@ -122,7 +122,8 @@ export class Session {
       await waitForDevTools(port, 30000)
     }
 
-    this.#page = await attachFirstPage(port)
+    // 同 #doHarvest：优先连 gemini 页面，别被排在前面的扩展页抢走。
+    this.#page = await attachFirstPage(port, { preferOrigin: this.#config.upstream.origin })
     this.#page.on('close', () => { this.#page = null })
   }
 
@@ -163,7 +164,11 @@ export class Session {
         await waitForDevTools(port, 30000)
       }
 
-      page = await attachFirstPage(port)
+      // 目标页必须优先选 gemini 域名下的那个：真实 profile 里 Chromium 列在
+      // 前面的往往是扩展页（实测第一个 page 是 chrome-extension://…/install.html）。
+      // 连到扩展页时 cookie 与 SNlM0e 照样抓得到（同 profile 共享），但真正的
+      // StreamGenerate 请求发不出去，表现为一直挂到超时。
+      page = await attachFirstPage(port, { preferOrigin: origin })
 
       // Navigate to app if not already there.
       const here = await evaluate(page, 'location.origin')
@@ -332,6 +337,30 @@ export class Session {
   async generateRaw({ prompt, conversationId = '', responseId = '', choiceId = '', timeoutMs = 120000 }) {
     await this.#ensurePage()
     if (this.tokensStale()) await this.scrapePageTokens()
+
+    // 兜底：页面若处于 hidden（窗口被移出屏幕 / 最小化 / 被别的窗口完全遮挡），
+    // Chromium 的后台节流会把页内 fetch 一起冻住——连请求都发不出去，
+    // 表现就是一路挂到超时，而 cookie 和 token 全都是好的。
+    // launchBrowser 已经强制加了防节流开关；这里是给「浏览器不是我们启动的」
+    // 那一类情况（用户自己开着、或老配置起的）留的自愈路径。
+    const vis = await evaluate(this.#page, 'document.visibilityState + "|" + (document.hasFocus() ? 1 : 0)').catch(() => '')
+    if (typeof vis === 'string' && vis.startsWith('hidden|0')) {
+      // Page.bringToFront 能让标签页重新可见，通常足以解除节流。
+      await this.#page.send('Page.bringToFront', {}).catch(() => {})
+      await new Promise(r => setTimeout(r, 300))
+      const after = await evaluate(this.#page, 'document.visibilityState + "|" + (document.hasFocus() ? 1 : 0)').catch(() => '')
+      if (typeof after === 'string' && after.startsWith('hidden|0')) {
+        throw Object.assign(
+          new Error(
+            'page is hidden and Chromium is throttling its network; the generation request cannot be sent. '
+            + 'Restart the browser profile (or make its window visible) so it launches with '
+            + '--disable-backgrounding-occluded-windows --disable-renderer-backgrounding '
+            + '--disable-background-timer-throttling',
+          ),
+          { status: 0 },
+        )
+      }
+    }
 
     const { origin, batchExecutePath } = this.#config.upstream
     const { snlm0e, bl } = this.#pageTokens
