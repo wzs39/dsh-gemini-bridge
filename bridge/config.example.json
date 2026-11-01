@@ -38,20 +38,8 @@
     "emptyRetries": 1
   },
   "protection": {
-    "requestsPerDay": 20,
-    "minGapMs": 8000,
-    "maxGapMs": 25000,
-    "failureBreakerAt": 2,
-    "failureBreakerCooldownMs": 3600000,
-    "budgetWindowsPerDay": 24,
-    "requestsPerHour": 4,
-    "burstWindowMs": 1200000,
-    "burstRestMs": 480000,
-    "burstIdleResetMs": 600000,
-    "minTurnCycleMs": 15000,
-    "maxInlineWaitMs": 120000,
-    "maxConcurrentWaiters": 1,
-    "anomalyThreshold": 4
+    "preset": "balanced",
+    "_comment": "preset 是 cautious | balanced | brisk 三档之一。显式写下面的数字会覆盖 preset 的同名字段；不写就用 preset 的值。/health 的 pacingPreset 和 dailyCeiling 会告诉你实际生效的是什么。"
   },
   "debug": {
     "capture": false

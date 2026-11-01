@@ -155,6 +155,7 @@ export class Guard {
 
   status() {
     const budget = this.#config.protection.requestsPerDay
+    const prot = this.#config.protection
     return {
       level: this.#state.level,
       reason: this.#state.reason,
@@ -162,6 +163,12 @@ export class Guard {
       requestsToday: this.#state.requestsToday,
       budgetPerDay: budget,
       budgetUsedPercent: budget > 0 ? Math.round((this.#state.requestsToday / budget) * 100) : 0,
+      // Which pacing preset is actually in force, and the real daily ceiling it
+      // produces. Reported because the two can differ from what the config file
+      // literally says: windowCap = ceil(requestsPerDay / budgetWindowsPerDay)
+      // rounds up, so a sub-1 ratio silently becomes 1/hour.
+      pacingPreset: prot.appliedPreset ?? null,
+      dailyCeiling: prot.effectiveCeilingPerDay ?? null,
       anomalyScore: Number(this.#state.anomalyScore.toFixed(2)),
       consecutiveFailures: this.#consecutiveFailures,
       nextAllowedInMs: Math.max(0, this.#nextAllowedAt - Date.now()),
@@ -500,11 +507,24 @@ export class Guard {
     return true
   }
 
+  /**
+   * Score a silent-degradation signal (a 200 with nothing in it).
+   *
+   * Anchored to the 1h cooldown, not to an ever-falling score, so repeated
+   * anomalies cannot extend a park indefinitely: at most one punish per hour,
+   * and `#punish` keeps the longest remaining window.
+   */
   anomaly(reason, weight = 1) {
     this.#state.anomalyScore += weight
     const threshold = this.#config.protection.anomalyThreshold ?? 4
     if (this.#state.anomalyScore >= threshold) {
-      this.#punish({ level: 2, cooldownMs: 60 * 60 * 1000, reason: `anomaly: ${reason}` })
+      // At most one anomaly-driven park per cooldown window.
+      if (this.#state.cooldownUntil <= Date.now()) {
+        this.#punish({ level: 2, cooldownMs: 60 * 60 * 1000, reason: `anomaly: ${reason}` })
+      }
+      // Reset after tripping so the NEXT window needs a fresh pair of signals
+      // rather than one more empty answer re-arming the cooldown forever.
+      this.#state.anomalyScore = 0
     }
     this.#dirty = true
     this.#save()

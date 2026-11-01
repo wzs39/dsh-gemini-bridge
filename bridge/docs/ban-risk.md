@@ -123,17 +123,58 @@ node bin/verify.mjs                      # 真实一问 + 健康报告
 curl -s http://127.0.0.1:18901/health    # parked / anomaly / window 全看
 ```
 
-首周建议参数（新 profile / 新登录）：
+首周建议用 `cautious` 档（新 profile / 新登录）：
 
 ```json
-"protection": {
-  "requestsPerDay": 10,
-  "minGapMs": 15000,
-  "maxGapMs": 45000,
-  "failureBreakerAt": 2,
-  "failureBreakerCooldownMs": 3600000
-}
+"protection": { "preset": "cautious" }
 ```
+
+## 四甲、节奏档位（改这里，不要手调那 15 个数字）
+
+`protection` 里的字段互相咬合，手调一个会悄悄弄坏另一个。最坑的一条：
+
+```
+windowCap = ceil(requestsPerDay / budgetWindowsPerDay)
+```
+
+旧默认 `20 / 24` → `ceil(0.83) = 1`，即**每账号每小时 1 次**。配置上写着"每天
+20 次"，日额度根本摸不到；真人对话 20 秒一条，早就越界。实测：pro1 用掉那 1 次
+之后，下一个请求直接 429，而 pro2/pro3 完全闲置——三账号池退化成单账号。
+
+所以现在只用 preset，不再写散装数字：
+
+| preset | windowCap | 日上限/账号 | 小时上限 | 间隔 | burst | 适用 |
+|---|---|---|---|---|---|---|
+| `cautious` | 2/h | 48 | 6 | 15–45s | 20min 活动 / 8min 休息 | 新 profile、新登录、首周 |
+| `balanced` | 5/h | 120 | 12 | 6–18s | 30min / 5min | 默认，正常重度自用 |
+| `brisk` | 17/h | 408 | 30 | 2–6s | 40min / 3min | 长 agent 跑批 |
+
+显式写某个数字仍会覆盖同名字段（例如只把 `requestsPerHour` 调到 20）。
+`/health` 的 `pacingPreset` / `windowCap` / `dailyCeiling` 报的是**实际生效值**，
+不是配置文件里的字面值。
+
+**真正在保护账号的是三道闸，不是日额度：**
+① 请求间隔（`minGapMs`–`maxGapMs`，越像真人越好）
+② 小时上限 + burst 强制休息（打断"连续机器节奏"）
+③ 异常检测（空回答 = 降级第一信号）
+
+调高 preset 只是放宽日/窗口额度，这三道闸一档都不会松。失败反应
+（`failureBreakerAt`、`anomalyThreshold`）在所有档位完全一致——吞吐是调优选择，
+"多久判定账号出事"不是。
+
+### 空回答不要用单个请求判定
+
+实测踩到的坑：一次爆发测试里 20 个请求 0 成功，三个账号同时被 park 65 分钟。
+原因不是配额，是**同一个请求里既给首次空回答记 2 分、又给失败重试记 2 分**，
+凑满阈值 4 就停号一小时。一个瞬时抖动不该有这个代价。
+
+现在的规则：
+- 首次空回答 → 刷新 token 重试一次，**不记分**
+- 重试仍空 → 记 2 分（一次确认失败 = 两个信号中的一个）
+- 第二次确认失败才触发 1h 冷却；触发后分数归零，避免一次失误反复续期
+
+修复前后同一个 20 次爆发：**0/20 → 16/20**，剩下 4 次是 pro1 窗口真的满了
+（`17/17`），报错如实写 `window budget spent` 和释放时间。
 
 作息：白天用、夜里 0 流量是**正常人类形状**，不设夜间保活以外的请求。
 

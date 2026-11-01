@@ -92,3 +92,66 @@ describe('Guard', () => {
     assert.ok(fired, 'a budget guard should have fired before budget+5 requests')
   })
 })
+
+/**
+ * Anomaly scoring.
+ *
+ * Measured regression: a burst of 20 requests ended with all three Pro accounts
+ * parked for ~65 minutes. The cause was scoring the FIRST empty answer (weight
+ * 2) AND the failed retry (weight 2) on the same request -- 4 points, the whole
+ * threshold, from one hiccup. A transient upstream blip must not cost an hour.
+ */
+describe('Guard: anomaly scoring must need a repeated signal', () => {
+  let guard, config
+
+  before(() => {
+    config = makeConfig()
+    guard = new Guard(config)
+  })
+
+  after(() => {
+    guard.stop()
+    fs.rmSync(config.paths.logs, { recursive: true, force: true })
+  })
+
+  it('the threshold equals two weighted signals', () => {
+    assert.equal(config.protection.anomalyThreshold, 4)
+  })
+
+  it('one signal (weight 2) does not park the account', () => {
+    guard.reset()
+    guard.anomaly('empty-answer-confirmed', 2)
+    assert.equal(guard.status().cooldownSeconds, 0, 'a single signal must not park')
+    assert.equal(guard.status().anomalyScore, 2, 'but it is remembered')
+  })
+
+  it('a second signal trips exactly one cooldown', () => {
+    guard.anomaly('empty-answer-confirmed', 2)
+    assert.ok(guard.status().cooldownSeconds > 0, 'two signals must park')
+  })
+
+  it('the score resets after tripping, so it cannot re-arm forever', () => {
+    // Without the reset, one more empty answer would immediately re-punish and
+    // an account could never climb out of the hole.
+    assert.equal(guard.status().anomalyScore, 0, 'score must reset after punish')
+    guard.anomaly('empty-answer-confirmed', 2)
+    assert.equal(guard.status().anomalyScore, 2)
+    guard.anomaly('empty-answer-confirmed', 2)
+    // Second trip while already parked must not extend the existing window.
+    const first = guard.status().cooldownSeconds
+    guard.anomaly('empty-answer-confirmed', 2)
+    guard.anomaly('empty-answer-confirmed', 2)
+    assert.ok(
+      guard.status().cooldownSeconds <= first + 2,
+      'a trip during an existing park must not meaningfully extend it',
+    )
+  })
+
+  it('a success decays the score back toward zero', () => {
+    guard.reset()
+    guard.anomaly('x', 2)
+    assert.equal(guard.status().anomalyScore, 2)
+    guard.succeeded()
+    assert.equal(guard.status().anomalyScore, 0, 'success decays by 2')
+  })
+})

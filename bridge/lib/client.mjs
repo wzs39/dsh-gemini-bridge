@@ -136,9 +136,13 @@ export class GeminiWebClient {
 
       let parsed = parseGenerateResponse(raw)
       if (!parsed?.text && verdict.class === 'ok') {
-        // 200 with nothing to say. Score it; emptyRetries stays capped at 1 and
-        // only re-issues after a token refresh -- never on auth-class stops.
-        guard.anomaly('empty-answer', 2)
+        // 200 with nothing to say. One empty answer is NOT proof the account is
+        // degraded -- it is also what a transient upstream hiccup looks like,
+        // and a single burst measured three accounts parked for 65 minutes on
+        // the strength of one empty reply each. So: retry once, and only score
+        // the account when the retry ALSO comes back empty. That makes
+        // "two 200-with-nothing in a row" the real signal, which is what the
+        // threshold of 4 was always meant to describe.
         const retries = this.#config.behaviour.emptyRetries ?? 1
         if (retries > 0) {
           await session.scrapePageTokens()
@@ -153,8 +157,11 @@ export class GeminiWebClient {
             const v2 = this.#manager.report(account, { status: 200, raw: raw2 })
             if (v2.class === 'ok') parsed = parseGenerateResponse(raw2) ?? parsed
           }
-          if (!parsed?.text) guard.anomaly('empty-answer-retry', 2)
         }
+        // Score only a confirmed failure (retry absent or also empty). Weight 2
+        // = one of the two signals the threshold expects; a later empty request
+        // supplies the second.
+        if (!parsed?.text) guard.anomaly('empty-answer-confirmed', 2)
       }
 
       if (!parsed?.text) {
