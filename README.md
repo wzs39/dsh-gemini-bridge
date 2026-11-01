@@ -20,15 +20,19 @@ DSH 模型选择器
 **防封体系**（bridge 内置 + 插件互补，完整推导见
 [bridge/docs/ban-risk.md](bridge/docs/ban-risk.md)，源自一次真实封号复盘）：
 
+> 踩过的坑与排查方法已整理成第一手复盘：
+> **[反代 Gemini 网页端：五个让「全部账号不可用」的坑](docs/lessons-gemini-web-reverse-proxy.md)**
+> —— 六个「看起来像封号」的现象，没有一个真的和风控有关。
+
 | 层 | 机制 |
 |---|---|
 | 指纹 | 网页通道页内 fetch；agy 通道 Node TLS = CLI 同款 |
-| 节奏 | 钟形抖动间隔 8–25 s、轮次周期下限、burst 强制休息 |
+| 节奏 | 档位化（cautious / balanced / brisk），间隔 + burst 强制休息 |
 | 预算 | 日预算摊到 24 窗口 + 小时上限；拒绝伪装成空 200 |
 | 熔断 | auth/captcha/throttle 分级 park（12h/24h/1h），hard-stop 零重试 |
-| 软封 | 200 空回答计异常分，两次即冷却 |
+| 软封 | 200 空回答计异常分，**确认两次**才冷却（重试失败不单独计分） |
 | 并发 | bridge 串行队列 + 插件闸门（默认 ≤2 并发流）|
-| 多账号 | 每账号独立浏览器 profile/端口/守卫状态；park 自动轮转 |
+| 多账号 | 每账号独立浏览器 profile/端口/守卫状态；配额感知轮转 |
 
 ### agy 多账号池（复用 dsh-agy-link 的账号库）
 
@@ -162,16 +166,29 @@ node <插件目录>/bridge/bin/login.mjs --account default
 
 ## 防封配置速查（`~/.dsh/gemini-bridge/config.json`）
 
+节奏只用档位选，不再手调那 15 个互相咬合的数字（推导见
+[bridge/docs/ban-risk.md §四甲](bridge/docs/ban-risk.md)）：
+
 ```jsonc
 "protection": {
-  "requestsPerDay": 20,      // 每账号每日预算；新号首周建议 10
-  "minGapMs": 8000,          // 请求间隔下限（首周建议 15000）
-  "maxGapMs": 25000,
-  "anomalyThreshold": 4      // 软封异常分阈值
+  "preset": "balanced"      // cautious | balanced | brisk
+                            //   cautious  2/h   48/day  gap 15-45s   新号首周
+                            //   balanced  5/h  120/day  gap  6-18s   正常自用
+                            //   brisk    17/h  408/day  gap  2-6s    长 agent
 },
 "agy": { "enabled": true },  // 关掉 agy 通道只留网页通道
 "accounts": [ ... ]          // 多账号名册（各自独立 profile）
 ```
+
+**手调单个数字仍会覆盖同名字段**，但要知道哪些不能松：
+
+- 能调（只影响吞吐）：`requestsPerDay` / `budgetWindowsPerDay` / `requestsPerHour`
+- **不要松**（这几道才在护号）：`minGapMs`–`maxGapMs` 请求间隔、
+  `burstWindowMs`+`burstRestMs` 强制休息、`anomalyThreshold` 软封检测
+
+⚠️ `windowCap = ceil(requestsPerDay / budgetWindowsPerDay)`。写 `20 / 24` 得到
+`ceil(0.83) = 1`，即**每账号每小时 1 次**，日额度根本摸不到。`/health` 的
+`pacingPreset` / `windowCap` / `dailyCeiling` 报的是**实际生效值**，以它为准。
 
 插件设置（DSH 设置页）：`noRetry`（默认开——冷却期绝不重试）、
 `maxConcurrent`（默认 2）、`models` 静态清单、进程托管开关等。
@@ -199,7 +216,13 @@ lib/index.js          Host 半身：进程托管、配置 seed、provider 注册
 lib/openai-adapter.js DSH 词表 <-> OpenAI SSE（session-title 短路/闸门/透传拒绝）
 lib/client.js         浏览器半身：usage 卡片（含 agy 池逐账号状态行）
 bridge/               网关本体（Node ≥22，零第三方依赖，可脱离插件独立运行）
+  lib/cdp.mjs         RFC 6455 帧解析（不要用数括号切 JSON，见复盘 §1）
+  lib/parser.mjs      StreamGenerate 解析（累积快照语义，见复盘 §4）
+  lib/guard.mjs       节奏/预算/熔断/异常分（档位化，availability() 供轮转查询）
+  lib/manager.mjs     账号挑选（配额感知，不只看 park 状态）
+bridge/test/fixtures/ 真实上游响应，解析器回归依据
 bridge/tools/         探针与应急脚本
+docs/                 第一手复盘
 ```
 
 - 回环端点默认无鉴权之外不加暴露：bridge 只绑 `127.0.0.1`，apiKey 必填非空。
@@ -207,6 +230,7 @@ bridge/tools/         探针与应急脚本
   本地改动恢复（标记跟账号走）。
 - 本工具降低封号概率，不免疫。上游风控是黑盒；转售/共享凭属最高执法优先级，
   请勿外发端点。
+- 改任何节奏参数后跑 `cd bridge && npm test`（132 用例）再部署。
 
 ## License
 
