@@ -211,4 +211,83 @@ describe('AgyPool (dsh-agy-link pool.json consumer)', () => {
     assert.equal(empty.count, 0)
     assert.equal(empty.pick(), null)
   })
+
+  it('quota groups drive per-group usability, not a single boolean', () => {
+    // A real account can serve gemini while its anthropic/openai quota is at 0
+    // (observed live). A single account-level boolean hides exactly that, which
+    // is how the dashboard used to claim "ready" for a partly-dead account.
+    writePoolFile([
+      {
+        id: 'acc_split', alias: 'Split', email: 'split@example.com', enabled: true,
+        dir: path.join(tmpDir, 'acc_b'),
+        quotas: {
+          google: {
+            remainingFraction: 0.99, resetTime: new Date(Date.now() + 3600_000).toISOString(),
+            models: [{ modelId: 'gemini-3.8-flash-high', remainingFraction: 0.99 }],
+          },
+          anthropic: {
+            remainingFraction: 0, resetTime: new Date(Date.now() + 3600_000).toISOString(),
+            models: [{ modelId: 'claude-sonnet-4-6', remainingFraction: 0 }],
+          },
+        },
+        cooldowns: {
+          anthropic: { cooldownUntil: Date.now() + 3600_000, reason: 'quota' },
+        },
+      },
+    ])
+    const p = new AgyPool({ config: { agy: { poolFile: path.join(tmpDir, 'pool.json') } } })
+    const d = p.describeAll()[0]
+    const byGroup = Object.fromEntries(d.quota.groups.map(g => [g.group, g]))
+    assert.equal(byGroup.google.usable, true, 'a group with quota left stays usable')
+    assert.equal(byGroup.anthropic.usable, false, 'an exhausted group must not report usable')
+    assert.equal(byGroup.anthropic.exhausted, true)
+    assert.equal(byGroup.anthropic.cooling, true)
+    assert.equal(d.usable, true, 'the account is usable while at least one group can serve')
+  })
+
+  it('an account whose every quota group is exhausted is not usable', () => {
+    writePoolFile([
+      {
+        id: 'acc_dead', alias: 'Dead', email: 'dead@example.com', enabled: true,
+        dir: path.join(tmpDir, 'acc_b'),
+        quotas: {
+          google: { remainingFraction: 0, resetTime: new Date(Date.now() + 3600_000).toISOString(), models: [] },
+        },
+        cooldowns: {},
+      },
+    ])
+    const p = new AgyPool({ config: { agy: { poolFile: path.join(tmpDir, 'pool.json') } } })
+    assert.equal(p.describeAll()[0].usable, false, 'all groups empty -> account unusable')
+  })
+
+  it('a parked account is never usable, even with full quota', () => {
+    writePoolFile([
+      {
+        id: 'acc_parked', alias: 'Parked', email: 'parked@example.com', enabled: true,
+        dir: path.join(tmpDir, 'acc_b'),
+        quotas: { google: { remainingFraction: 1, models: [] } },
+        cooldowns: {},
+      },
+    ])
+    const p = new AgyPool({ config: { agy: { poolFile: path.join(tmpDir, 'pool.json') } } })
+    const acct = p.pick()
+    p.pause(acct, 60_000, 'auth')
+    const d = p.describeAll()[0]
+    assert.equal(d.usable, false, 'a parked account must not be reported usable')
+    assert.ok(d.pausedUntil)
+    assert.equal(d.pauseReason, 'auth')
+  })
+
+  it('missing quota data falls back to credential+park, not a fake green', () => {
+    // pool.json written by an older dsh-agy-link may carry no quotas at all.
+    // Missing data must not be reported as unusable (it may well work), and it
+    // must not be reported as fresh quota either.
+    writePoolFile([
+      { id: 'acc_noq', alias: 'NoQuota', email: 'noq@example.com', enabled: true, dir: path.join(tmpDir, 'acc_b') },
+    ])
+    const p = new AgyPool({ config: { agy: { poolFile: path.join(tmpDir, 'pool.json') } } })
+    const d = p.describeAll()[0]
+    assert.deepEqual(d.quota.groups, [], 'no quota data -> empty groups')
+    assert.equal(d.usable, true, 'credential present and not parked -> usable')
+  })
 })

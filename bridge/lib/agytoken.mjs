@@ -249,28 +249,120 @@ export class AgyPool {
 
   /** Enabled accounts from pool.json; missing/corrupt file -> empty pool. */
   #readPoolAccounts() {
+    return this.#readPoolFile().accounts
+  }
+
+  /**
+   * pool.json 全文（accounts + quotas + cooldowns）。
+   *
+   * 配额和冷却本来就在这个文件里（dsh-agy-link 写的），只是之前没用起来：
+   * 面板只能看到「token 读不读得到」，看不到「还剩多少额度」。token 可读
+   * 只意味着凭据没过期，跟上游愿不愿意服务完全是两件事——实测过三个号都
+   * 因为 VALIDATION_REQUIRED 被 403 时，token 依然全部 loaded=true。
+   */
+  #readPoolFile() {
     try {
       const pool = JSON.parse(fs.readFileSync(this.#poolFile, 'utf8'))
-      return (Array.isArray(pool?.accounts) ? pool.accounts : [])
+      const accounts = (Array.isArray(pool?.accounts) ? pool.accounts : [])
         .filter(a => a && a.enabled !== false && (a.dir || a.systemHome))
+      return { accounts, raw: pool }
     } catch {
-      return []
+      return { accounts: [], raw: null }
     }
   }
 
   get count() { return this.#accounts.length }
 
+  /**
+   * 一个账号的配额与冷却快照（来自 pool.json，不是我们自己的计量）。
+   *
+   * 形状（上游写法，原样透出，不做归一化，免得 Google 加组时丢信息）：
+   *   { [group]: { remaining, resetTime, weekly, weeklyReset, models: [{id, remaining, resetTime}] } }
+   * 冷却：{ [group]: { until, reason } }
+   */
+  #quotaFor(id) {
+    const raw = this.#readPoolFile().raw
+    const entry = (raw?.accounts ?? []).find(a => a?.id === id)
+    if (!entry) return { groups: [], cooldowns: [] }
+
+    const groups = []
+    for (const [group, q] of Object.entries(entry.quotas ?? {})) {
+      if (!q || typeof q !== 'object') continue
+      groups.push({
+        group,
+        remaining: typeof q.remainingFraction === 'number' ? q.remainingFraction : null,
+        resetTime: q.resetTime ?? null,
+        weekly: typeof q.weeklyFraction === 'number' ? q.weeklyFraction : null,
+        weeklyReset: q.weeklyResetTime ?? null,
+        description: q.description ?? null,
+        updatedAt: q.updatedAt ?? null,
+        models: (Array.isArray(q.models) ? q.models : []).map(m => ({
+          id: m.modelId ?? m.id ?? null,
+          name: m.displayName ?? m.modelId ?? null,
+          remaining: typeof m.remainingFraction === 'number' ? m.remainingFraction : null,
+          resetTime: m.resetTime ?? null,
+        })),
+      })
+    }
+
+    const cooldowns = []
+    for (const [group, c] of Object.entries(entry.cooldowns ?? {})) {
+      if (!c || typeof c !== 'object') continue
+      cooldowns.push({
+        group,
+        until: c.cooldownUntil ?? null,
+        reason: c.reason ?? null,
+      })
+    }
+    return { groups, cooldowns }
+  }
+
   describeAll() {
     const now = Date.now()
-    return this.#accounts.map(a => ({
-      id: a.id,
-      alias: a.alias,
-      email: a.email,
-      systemHome: a.systemHome,
-      token: a.tokens.describe(),
-      pausedUntil: a.pausedUntil > now ? a.pausedUntil : null,
-      pauseReason: a.pauseReason,
-    }))
+    return this.#accounts.map(a => {
+      const { groups, cooldowns } = this.#quotaFor(a.id)
+      const token = a.tokens.describe()
+      const parked = a.pausedUntil > now
+
+      // 每个配额组各自判活：一个账号可能 gemini 还能打、anthropic 已经 0%。
+      // 用单一 usable 布尔会把「部分可用」抹平成「可用」，那正是面板骗人的
+      // 根源。这里透出 per-group 结论，让调用方自己决定要哪一组。
+      const groupState = groups.map(g => {
+        const cooling = cooldowns.find(c => c.group === g.group && c.until && c.until > now)
+        const exhausted = g.remaining !== null && g.remaining <= 0
+        return {
+          group: g.group,
+          remaining: g.remaining,
+          weekly: g.weekly,
+          resetTime: g.resetTime,
+          weeklyReset: g.weeklyReset,
+          cooling: Boolean(cooling),
+          cooldownUntil: cooling?.until ?? null,
+          cooldownReason: cooling?.reason ?? null,
+          exhausted,
+          // 组可用 = 凭据在 + 没被 park + 该组没冷却 + 该组没耗尽
+          usable: Boolean(token.loaded) && !parked && !cooling && !exhausted,
+        }
+      })
+
+      // 账号级 usable = 至少一个组可用。没有配额信息（pool.json 没写过该号）
+      // 时退回只看凭据与 park —— 缺数据不等于不可用，但也不谎报成绿。
+      const usable = groupState.length > 0
+        ? groupState.some(g => g.usable)
+        : Boolean(token.loaded) && !parked
+
+      return {
+        id: a.id,
+        alias: a.alias,
+        email: a.email,
+        systemHome: a.systemHome,
+        token,
+        pausedUntil: parked ? a.pausedUntil : null,
+        pauseReason: a.pauseReason,
+        quota: { groups: groupState, cooldowns },
+        usable,
+      }
+    })
   }
 
   /** Next usable account: sticky cursor round-robin, skipping parked. */

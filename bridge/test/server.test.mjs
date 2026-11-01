@@ -142,3 +142,110 @@ describe('server refusal semantics', () => {
     assert.equal(r.headers.get('retry-after'), '120')
   })
 })
+
+describe('health contract', () => {
+  // These guard the dashboard's honesty. Every one of them corresponds to a
+  // real way /health used to report "ready" while the channel was dead.
+
+  it('agy pool accounts count toward usableAccounts', async () => {
+    // Regression: usable used to only count web accounts, so a working 3-account
+    // agy pool reported usableAccounts: 0 with no web account signed in.
+    const client = makeClient()
+    client.describeAll = () => ({
+      accounts: [],
+      agy: {
+        enabled: true,
+        models: ['gemini-3.8-flash-medium'],
+        pool: {
+          count: 3,
+          accounts: [
+            { id: 'a', token: { loaded: true }, usable: true, pausedUntil: null, quota: { groups: [] } },
+            { id: 'b', token: { loaded: true }, usable: true, pausedUntil: null, quota: { groups: [] } },
+            { id: 'c', token: { loaded: true }, usable: false, pausedUntil: null, quota: { groups: [] } },
+          ],
+        },
+      },
+    })
+    const { base } = await start(client, 18996)
+    const data = await (await fetch(`${base}/health`)).json()
+    assert.equal(data.usableAccounts, 2, 'only accounts marked usable may be counted')
+    assert.equal(data.totalAccounts, 3)
+    assert.equal(data.channels.agy.usable, 2)
+    assert.equal(data.channels.agy.total, 3)
+    assert.equal(data.channels.agy.state, 'ready')
+    assert.equal(data.channels.web.state, 'signed-out')
+  })
+
+  it('a readable token is not enough: pool accounts marked unusable stay unusable', async () => {
+    // The validation-gate incident: all three accounts had loaded tokens and all
+    // three were 403 VALIDATION_REQUIRED. Token-only health showed green.
+    const client = makeClient()
+    client.describeAll = () => ({
+      accounts: [],
+      agy: {
+        enabled: true,
+        models: [],
+        pool: {
+          count: 2,
+          accounts: [
+            { id: 'a', token: { loaded: true }, usable: false, pausedUntil: null, quota: { groups: [] } },
+            { id: 'b', token: { loaded: true }, usable: false, pausedUntil: null, quota: { groups: [] } },
+          ],
+        },
+      },
+    })
+    const { base } = await start(client, 18995)
+    const data = await (await fetch(`${base}/health`)).json()
+    assert.equal(data.usableAccounts, 0)
+    assert.notEqual(data.channels.agy.state, 'ready', 'tokens readable but nothing serving must not read as ready')
+  })
+
+  it('all-parked pool reports parked, not signed-out and not ready', async () => {
+    const client = makeClient()
+    client.describeAll = () => ({
+      accounts: [],
+      agy: {
+        enabled: true,
+        models: [],
+        pool: {
+          count: 1,
+          accounts: [{
+            id: 'a', token: { loaded: true }, usable: false,
+            pausedUntil: Date.now() + 3600_000, pauseReason: 'auth',
+            quota: { groups: [] },
+          }],
+        },
+      },
+    })
+    const { base } = await start(client, 18994)
+    const data = await (await fetch(`${base}/health`)).json()
+    assert.equal(data.status, 'parked')
+    assert.equal(data.channels.agy.state, 'parked')
+    assert.equal(data.usableAccounts, 0)
+  })
+
+  it('single-account agy mode still reports its credential state', async () => {
+    const client = makeClient()
+    client.describeAll = () => ({
+      accounts: [],
+      agy: { enabled: true, models: ['m'], token: { loaded: true } },
+    })
+    const { base } = await start(client, 18993)
+    const data = await (await fetch(`${base}/health`)).json()
+    assert.equal(data.channels.agy.usable, 1)
+    assert.equal(data.channels.agy.total, 1)
+    assert.equal(data.status, 'ready')
+  })
+
+  it('a disabled agy channel reports disabled rather than a credential problem', async () => {
+    const client = makeClient()
+    client.describeAll = () => ({
+      accounts: [],
+      agy: { enabled: false, models: [] },
+    })
+    const { base } = await start(client, 18992)
+    const data = await (await fetch(`${base}/health`)).json()
+    assert.equal(data.channels.agy.state, 'disabled')
+    assert.equal(data.channels.agy.usable, 0)
+  })
+})

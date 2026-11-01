@@ -154,17 +154,55 @@ export function createServer(config, client) {
     if (req.method === 'GET' && url.pathname === '/health') {
       const described = client.describeAll?.() ?? { accounts: client.manager?.describeAll?.() ?? [], agy: null }
       const accounts = described.accounts
-      const usable = accounts.filter(a => !a.pausedUntil && a.session?.ready).length
-      const agyReady = Boolean(described.agy?.token?.loaded ?? described.agy)
+      const agy = described.agy ?? null
+
+      // Web 账号：parked / 会话就绪。
+      const webUsable = accounts.filter(a => !a.pausedUntil && a.session?.ready).length
+
+      // agy 账号：pool 模式下逐号判定 usable（token 可读 + 未 park + 无冷却）；
+      // 单号模式退回看 token.loaded。以前这里读的是 agy.token.loaded，pool 模式
+      // 压根没有 token 字段，于是三个号全绿时也报 0 可用。
+      const agyAccounts = agy?.pool?.accounts ?? []
+      const agyUsable = agyAccounts.length > 0
+        ? agyAccounts.filter(a => a.usable !== false && (a.token?.loaded ?? false)).length
+        : (agy?.token?.loaded ? 1 : 0)
+
+      const usable = webUsable + agyUsable
+      const total = accounts.length + agyAccounts.length
+      const anyParked = accounts.some(a => a.pausedUntil) || agyAccounts.some(a => a.pausedUntil)
+
       let status
-      if (usable > 0 || agyReady) status = 'ready'
-      else if (accounts.some(a => a.pausedUntil)) status = 'parked'
+      if (usable > 0) status = 'ready'
+      else if (anyParked) status = 'parked'
       else status = 'signed-out'
+
+      // 两条通道分别报状态：混成一个 ready 会掩盖「agy 能跑但网页号没登录」。
+      const channels = {
+        web: {
+          enabled: accounts.length > 0,
+          usable: webUsable,
+          total: accounts.length,
+          state: webUsable > 0 ? 'ready' : (accounts.some(a => a.pausedUntil) ? 'parked' : 'signed-out'),
+        },
+        agy: {
+          enabled: Boolean(agy?.enabled),
+          usable: agyUsable,
+          total: agyAccounts.length || (agy?.token ? 1 : 0),
+          state: !agy?.enabled
+            ? 'disabled'
+            : agyUsable > 0
+              ? 'ready'
+              : (agyAccounts.some(a => a.pausedUntil) ? 'parked' : 'no-credential'),
+          models: agy?.models ?? [],
+        },
+      }
+
       json(res, 200, {
         status,
         usableAccounts: usable,
-        totalAccounts: accounts.length,
-        agy: described.agy,
+        totalAccounts: total,
+        channels,
+        agy,
         accounts,
       })
       return
