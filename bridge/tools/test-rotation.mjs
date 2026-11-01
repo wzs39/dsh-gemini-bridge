@@ -1,5 +1,5 @@
-// Prove the pool rotates onto the second working account when the first is
-// parked, and that it comes back. Uses the real client against real upstream.
+// Full three-account rotation exercise: confirm traffic actually lands on all
+// three identities, survives a park, and recovers — against real upstream.
 import { AgyPool } from '../lib/agytoken.mjs'
 import { AgyClient } from '../lib/agyclient.mjs'
 import { loadConfig } from '../lib/config.mjs'
@@ -8,45 +8,50 @@ const config = loadConfig()
 const pool = new AgyPool({ config })
 const client = new AgyClient({ config, tokens: null, pool })
 
-// Pull out the two working accounts by identity so we can park one deliberately.
 const all = []
 for (let i = 0; i < pool.count; i++) { const a = pool.pick(); if (a && !all.includes(a)) all.push(a) }
-const kalao = all.find(a => a.id.includes('kalao'))
-const asabv = all.find(a => a.id.includes('asabv'))
-console.log(`pool=${pool.count} kalao=${Boolean(kalao)} asabv=${Boolean(asabv)}\n`)
+console.log(`pool = ${pool.count} account(s)`)
+for (const a of all) console.log(`  ${a.id}  ${a.email}`)
+
+const hits = new Map()
 
 async function turn(label) {
   const picked = pool.pick()
-  let text = ''
   const t0 = Date.now()
+  let text = ''
   try {
     for await (const e of client.complete({
       model: 'gemini-3.8-flash-medium',
       messages: [{ role: 'user', content: 'Reply with exactly: PONG' }],
       stream: false,
     })) text += e?.delta?.content ?? ''
-    console.log(`${label}  picked=${picked?.id ?? '?'}  ${Date.now() - t0}ms  reply=${JSON.stringify(text.trim())}`)
-    return text.trim()
+    const ok = text.trim() === 'PONG'
+    hits.set(picked.id, (hits.get(picked.id) ?? 0) + (ok ? 1 : 0))
+    console.log(`${label.padEnd(22)} ${(picked.id).padEnd(30)} ${String(Date.now() - t0).padStart(5)}ms  ${ok ? 'PONG' : JSON.stringify(text.trim())}`)
   } catch (e) {
-    console.log(`${label}  picked=${picked?.id ?? '?'}  ${Date.now() - t0}ms  ERROR ${e.message.slice(0, 100)}`)
-    return null
+    console.log(`${label.padEnd(22)} ${String(picked?.id).padEnd(30)} ${String(Date.now() - t0).padStart(5)}ms  ERROR ${e.message.slice(0, 80)}`)
   }
 }
 
-console.log('--- 1. normal (sticky) ---')
-await turn('turn-1')
-await turn('turn-2')
+console.log('\n--- sticky behaviour (3 turns) ---')
+for (let i = 1; i <= 3; i++) await turn(`sticky-${i}`)
 
-if (kalao && asabv) {
-  console.log('\n--- 2. park kalao, traffic must move to asabv ---')
-  pool.pause(kalao, 60_000, 'rotation-test')
-  await turn('turn-3')
-  await turn('turn-4')
-
-  console.log('\n--- 3. resume kalao ---')
-  pool.resume(kalao.id)
-  await turn('turn-5')
+console.log('\n--- force rotation through every account ---')
+for (const acct of all) {
+  for (const other of all) if (other !== acct) pool.pause(other, 120_000, 'rotation-drill')
+  await turn(`only-${acct.id.slice(-8)}`)
+  for (const other of all) if (other !== acct) pool.resume(other.id)
 }
 
-console.log('\nfinal park state:')
-for (const a of pool.describeAll()) console.log(`  ${a.id} parked=${a.pausedUntil ?? 'no'}`)
+console.log('\n--- resume all, back to sticky ---')
+for (const a of all) pool.resume(a.id)
+await turn('after-resume')
+
+console.log('\nper-account successful turns:')
+for (const a of all) console.log(`  ${a.id.padEnd(32)} ${hits.get(a.id) ?? 0}`)
+const served = [...hits.values()].filter(v => v > 0).length
+console.log(`\naccounts that actually served: ${served}/${pool.count}`)
+if (served < pool.count) {
+  console.log('WARN: some accounts never served')
+  process.exitCode = 1
+}
