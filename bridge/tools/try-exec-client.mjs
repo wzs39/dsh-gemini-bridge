@@ -157,3 +157,32 @@ if (panellist && mainPanel) {
 log('')
 log(failed === 0 ? '全部通过 —— bundle 在运行时是健康的' : `失败 ${failed}`)
 process.exitCode = failed === 0 ? 0 : 1
+
+// ── 真正渲染一遍组件树 ──
+// 注册成功不等于渲染不炸：样式改坏、用了未解构的 React API、组件里 undefined
+// 变量，都只在 render 那一刻才现形。这里把每个注册的组件按 slot 的 ownerProps
+// 调一次，任何 throw 都算失败。
+log('')
+log('== 组件渲染冒烟 ==')
+let renderFailed = 0
+const renderCheck = (name, fn) => {
+  try { fn(); log(`PASS  ${name} 可渲染`) }
+  catch (e) { log(`FAIL  ${name} 渲染抛错: ${e.name}: ${e.message}`); renderFailed++ }
+}
+
+for (const r of registered) {
+  const opts = r.options ?? {}
+  const label = opts.id ?? opts.key ?? opts.name
+  // ownerProps：sidebar.panellist 只给 { size, active }
+  const props = opts.name === 'sidebar.panellist'
+    ? { size: 18, active: false }
+    : { locale: (k) => String(k) }
+  renderCheck(label, () => {
+    const tree = r.component(props)
+    if (tree === undefined) throw new Error('组件返回 undefined')
+  })
+}
+
+log('')
+log(renderFailed === 0 ? '渲染全部通过' : `渲染失败 ${renderFailed}`)
+process.exitCode = (failed + renderFailed) === 0 ? 0 : 1
