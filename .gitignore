@@ -10,3 +10,4 @@ __pycache__/
 # (the addon writes captures here; logs are per-machine)
 bridge/tools/agy-response-dump/
 bridge/tools/*.log
+.git-commit-msg.txt
