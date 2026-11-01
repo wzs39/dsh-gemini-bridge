@@ -33,10 +33,10 @@ export class UpstreamError extends Error {
   }
 }
 
-/** The whole bridge is parked (every account paused). Callers should back off. */
+/** No account may take traffic (parked, quota-blocked, or pacing). Back off. */
 export class AllParkedError extends Error {
-  constructor(msRemaining) {
-    super(`all accounts parked; soonest release in ${Math.ceil(msRemaining / 60000)} min`)
+  constructor(msRemaining, detail = '') {
+    super(`no account can serve this call; soonest release in ${Math.ceil(msRemaining / 60000)} min${detail}`)
     this.name = 'AllParkedError'
     this.retryAfterMs = msRemaining
   }
@@ -79,7 +79,13 @@ export class GeminiWebClient {
       const startedAt = Date.now()
       const account = this.#manager.pick()
       if (!account) {
-        throw new AllParkedError(this.#manager.nextUnpauseInMs() || 60000)
+        // Distinguish two cases: everything parked, versus everything merely
+        // out of quota. The retry-after has the same shape, but the reason must
+        // not lie about what is actually happening.
+        const reasons = this.#manager.parkReasonFor?.() ?? []
+        const ms = this.#manager.nextUnpauseInMs() || 60000
+        const detail = reasons.length ? ` [${reasons.join('; ')}]` : ''
+        throw new AllParkedError(ms, detail)
       }
 
       const { session, guard } = account

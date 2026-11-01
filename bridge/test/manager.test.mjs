@@ -117,6 +117,84 @@ describe('AccountManager', () => {
   })
 })
 
+/**
+ * Regression: pick() used to look only at `pausedUntil` and ignore each
+ * account's own guard. With the shipped defaults (`requestsPerDay: 20`,
+ * `budgetWindowsPerDay: 24` => 1 request per account per hour) the first
+ * account to spend its window aborted the call with WINDOW_BUDGET while two
+ * healthy siblings sat idle — measured live on three Pro accounts.
+ */
+describe('AccountManager: per-account quota must not block siblings', () => {
+  let manager, config
+
+  // One request per account per window, so the second call must rotate.
+  const quotaConfig = () => {
+    const base = makeConfig()
+    return {
+      ...base,
+      protection: {
+        ...base.protection,
+        requestsPerDay: 24,
+        budgetWindowsPerDay: 24,   // => windowCap 1
+        requestsPerHour: 100,
+        minGapMs: 0,
+        maxGapMs: 0,
+        minTurnCycleMs: 0,
+      },
+      accounts: [
+        { name: 'q-a', label: 'Quota A' },
+        { name: 'q-b', label: 'Quota B' },
+        { name: 'q-c', label: 'Quota C' },
+      ],
+    }
+  }
+
+  before(() => {
+    config = quotaConfig()
+    manager = new AccountManager(config)
+  })
+
+  after(() => {
+    manager.stopAll()
+    fs.rmSync(config.paths.logs, { recursive: true, force: true })
+  })
+
+  it('an account whose window is spent is skipped, not returned', async () => {
+    const first = manager.pick()
+    assert.ok(first, 'first pick must succeed')
+    await first.guard.admit()   // consume the single per-window slot
+    assert.equal(first.guard.availability().ok, false, 'sanity: window is now spent')
+
+    const second = manager.pick()
+    assert.ok(second, 'a sibling with quota left must be picked')
+    assert.notEqual(second.name, first.name, 'must not hand back the spent account')
+  })
+
+  it('all three windows spent -> pick() returns null and says why', async () => {
+    // q-a's window was consumed by the previous test. Drain whatever is left
+    // rather than re-admitting a spent account (which throws by design).
+    for (const d of manager.describeAll()) {
+      const a = manager.pickAccountByName(d.name)
+      if (a.guard.availability().ok) await a.guard.admit()
+    }
+    assert.equal(manager.pick(), null)
+
+    const reasons = manager.parkReasonFor()
+    assert.equal(reasons.length, 3, 'every blocked account must be reported')
+    for (const r of reasons) assert.match(r, /window budget spent/, `unexpected reason: ${r}`)
+
+    assert.ok(manager.nextUnpauseInMs() > 0, 'retry-after must be a real wait')
+  })
+
+  it('a parked account still wins the reason report over a quota block', () => {
+    const acct = manager.pickAccountByName('q-a')
+    acct.pausedUntil = Date.now() + 60000
+    acct.pauseReason = 'unusual traffic'
+    const reasons = manager.parkReasonFor()
+    assert.ok(reasons.some(r => r.includes('unusual traffic')), `got: ${reasons.join(' | ')}`)
+  })
+})
+
 describe('AgyPool (dsh-agy-link pool.json consumer)', () => {
   let tmpDir
   let pool

@@ -108,29 +108,80 @@ export class AccountManager {
   }
 
   /**
-   * Pick the next usable account, round-robin, skipping paused ones.
+   * Pick the next usable account, round-robin, skipping paused ones AND ones
+   * whose own guard would refuse admission right now.
    *
-   * @returns the account entry, or null when every account is parked.
+   * The guard check matters: budgets are per account, so a window spent on
+   * pro1 says nothing about pro2/pro3. Skipping only on `pausedUntil` meant the
+   * first account to hit its window cap aborted the whole call with
+   * WINDOW_BUDGET while two siblings sat idle — the exact opposite of why a
+   * pool exists. parkReasonFor() reports why accounts were skipped so the
+   * caller can still return an honest retry-after.
+   *
+   * @returns the account entry, or null when no account may take traffic.
    * @throws nothing; a null return means "no traffic may go out right now".
    */
   pick() {
+    return this.#pickWhere(() => true)
+  }
+
+  /**
+   * Same as pick(), but only among accounts whose per-model eligibility holds.
+   * @param {(entry: object) => boolean} eligible
+   */
+  pickEligible(eligible) {
+    return this.#pickWhere(eligible)
+  }
+
+  #pickWhere(eligible) {
     const now = Date.now()
     for (let i = 0; i < this.#accounts.length; i++) {
       const candidate = this.#accounts[(this.#cursor + i) % this.#accounts.length]
       if (candidate.pausedUntil > now) continue
+      if (!eligible(candidate)) continue
+      // The account's own guard decides whether it can take a call.
+      if (candidate.guard.availability?.(now).ok === false) continue
       this.#cursor = (this.#accounts.indexOf(candidate) + 1) % this.#accounts.length
       return candidate
     }
     return null
   }
 
-  /** Seconds until the soonest parked account may be retried (for retry-after). */
+  /**
+   * Soonest moment ANY account could accept traffic again, with the reason.
+   * When every account is blocked equally this is the caller's retry-after.
+   */
   nextUnpauseInMs() {
     const now = Date.now()
-    const waits = this.#accounts
-      .filter(a => a.pausedUntil > now)
-      .map(a => a.pausedUntil - now)
+    const waits = []
+    for (const a of this.#accounts) {
+      const until = Math.max(
+        a.pausedUntil - now,
+        a.guard.availability?.(now).ok === false
+          ? (a.guard.availability(now).retryAfterMs ?? 0)
+          : 0,
+      )
+      if (until > 0) waits.push(until)
+    }
     return waits.length ? Math.min(...waits) : 0
+  }
+
+  /** Why no account can serve right now — for an honest 429 message. */
+  parkReasonFor() {
+    const now = Date.now()
+    const reasons = []
+    for (const a of this.#accounts) {
+      const paused = a.pausedUntil - now
+      if (paused > 0) {
+        reasons.push(`${a.name}: ${a.pauseReason ?? 'parked'} (${Math.ceil(paused / 1000)}s)`)
+        continue
+      }
+      const avail = a.guard.availability?.(now)
+      if (avail && avail.ok === false) {
+        reasons.push(`${a.name}: ${avail.reason} (${Math.ceil((avail.retryAfterMs ?? 0) / 1000)}s)`)
+      }
+    }
+    return reasons
   }
 
   /**

@@ -187,6 +187,81 @@ export class Guard {
     return Math.round((this.#recent.filter(Boolean).length / this.#recent.length) * 100)
   }
 
+  /**
+   * Would admit() succeed right now? Read-only — nothing is consumed and no
+   * timer is armed, so the account picker can ask before choosing.
+   *
+   * This exists because pick() used to look only at `pausedUntil`: an account
+   * whose window budget was spent (1 request per hour under the shipped
+   * `requestsPerDay: 20 / budgetWindowsPerDay: 24`) looked perfectly healthy,
+   * got picked, and then threw WINDOW_BUDGET — so ONE exhausted window blocked
+   * all three accounts instead of routing to a sibling with room left. With
+   * three accounts the whole point is that their budgets are independent.
+   *
+   * Only the cheap, definitely-knowable gates are checked. Cooldown and budget
+   * are exact; hourly rate and burst use the same math as the real gates.
+   *
+   * @returns {{ok: boolean, reason?: string, retryAfterMs?: number}}
+   */
+  availability(now = Date.now()) {
+    const remaining = this.#state.cooldownUntil - now
+    if (remaining > 0) {
+      return { ok: false, reason: this.#state.reason ?? 'cooling down', retryAfterMs: remaining }
+    }
+
+    const budget = this.#config.protection.requestsPerDay
+    if (budget > 0 && this.#state.requestsToday >= budget) {
+      const midnight = new Date()
+      midnight.setHours(24, 0, 0, 0)
+      return {
+        ok: false,
+        reason: `daily budget spent (${this.#state.requestsToday}/${budget})`,
+        retryAfterMs: Math.max(1000, midnight.getTime() - now),
+      }
+    }
+
+    const { requestsPerDay, budgetWindowsPerDay } = this.#config.protection
+    if (requestsPerDay > 0 && budgetWindowsPerDay > 0) {
+      const perWindow = this.#perWindowCap()
+      const windowMs = this.#windowMs()
+      const index = Math.floor(now / windowMs)
+      // A stale window index means the counter resets on the next admit.
+      const spent = this.#state.windowIndex === index ? this.#state.windowSpent : 0
+      if (spent >= perWindow) {
+        return {
+          ok: false,
+          reason: `window budget spent (${spent}/${perWindow})`,
+          retryAfterMs: Math.max(1000, (index + 1) * windowMs - now),
+        }
+      }
+    }
+
+    const hourCap = this.#config.protection.requestsPerHour
+    if (hourCap > 0) {
+      const used = this.#hourCount()
+      if (used >= hourCap) {
+        const oldest = this.#state.hourStamps.find(at => at > now - 60 * 60 * 1000)
+        return {
+          ok: false,
+          reason: `hourly rate reached (${used}/${hourCap})`,
+          retryAfterMs: oldest ? Math.max(1000, oldest + 60 * 60 * 1000 - now) : 60000,
+        }
+      }
+    }
+
+    const restFor = this.#restUntil - now
+    if (restFor > 0) {
+      return { ok: false, reason: 'resting between sessions', retryAfterMs: restFor }
+    }
+
+    const gapFor = this.#nextAllowedAt - now
+    if (gapFor > 0) {
+      return { ok: false, reason: 'pacing gap', retryAfterMs: gapFor }
+    }
+
+    return { ok: true }
+  }
+
   #hourCount() {
     const cutoff = Date.now() - 60 * 60 * 1000
     return this.#state.hourStamps.filter(at => at > cutoff).length
