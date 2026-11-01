@@ -1,0 +1,15 @@
+{
+  "title": "Gemini 反代",
+  "ready": "就绪",
+  "parked": "冷却中",
+  "signedOut": "未登录",
+  "offline": "网关未运行",
+  "account": "账号",
+  "budget": "今日",
+  "cooldown": "冷却",
+  "agy": "agy 通道",
+  "agyOn": "可用",
+  "agyOff": "无凭据",
+  "loginHint": "跑 node bridge/bin/login.mjs 登录",
+  "updated": "更新于"
+}

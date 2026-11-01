@@ -1,0 +1,57 @@
+{
+  "upstream": {
+    "origin": "https://gemini.google.com",
+    "appPath": "/app",
+    "batchExecutePath": "/_/BardChatUi/data/batchexecute",
+    "rpcid": "entertg"
+  },
+  "browser": {
+    "executable": null,
+    "headless": false,
+    "port": 9334,
+    "args": [
+      "--window-position=-32000,-32000"
+    ],
+    "userDataDir": null
+  },
+  "accounts": [
+    { "name": "default", "label": "Google 账号（单用户可只留一个）" }
+  ],
+  "server": {
+    "host": "127.0.0.1",
+    "port": 18901,
+    "apiKey": "sk-local-gemini-web",
+    "model": "gemini-web"
+  },
+  "agy": {
+    "enabled": true,
+    "project": "aicode-consumers",
+    "defaultModel": "gemini-3.8-flash",
+    "tokenFile": null
+  },
+  "behaviour": {
+    "keepAliveSeconds": 900,
+    "completionTimeoutMs": 120000,
+    "tokenTtlMs": 3600000,
+    "emptyRetries": 1
+  },
+  "protection": {
+    "requestsPerDay": 20,
+    "minGapMs": 8000,
+    "maxGapMs": 25000,
+    "failureBreakerAt": 2,
+    "failureBreakerCooldownMs": 3600000,
+    "budgetWindowsPerDay": 24,
+    "requestsPerHour": 4,
+    "burstWindowMs": 1200000,
+    "burstRestMs": 480000,
+    "burstIdleResetMs": 600000,
+    "minTurnCycleMs": 15000,
+    "maxInlineWaitMs": 120000,
+    "maxConcurrentWaiters": 1,
+    "anomalyThreshold": 4
+  },
+  "debug": {
+    "capture": false
+  }
+}

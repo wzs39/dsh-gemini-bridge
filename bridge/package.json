@@ -1,0 +1,13 @@
+{
+  "name": "gemini-web-bridge",
+  "version": "0.1.0",
+  "description": "Reverse proxy for gemini.google.com web UI, exposing an OpenAI-compatible local endpoint with account-protection guards",
+  "type": "module",
+  "scripts": {
+    "login": "node bin/login.mjs",
+    "serve": "node bin/serve.mjs",
+    "verify": "node bin/verify.mjs",
+    "test": "node --test test/agyconvert.test.mjs test/router.test.mjs test/detect.test.mjs test/manager.test.mjs test/server.test.mjs test/guard.test.mjs test/parser.test.mjs"
+  },
+  "engines": { "node": ">=22" }
+}

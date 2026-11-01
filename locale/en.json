@@ -1,0 +1,15 @@
+{
+  "title": "Gemini Bridge",
+  "ready": "Ready",
+  "parked": "Parked",
+  "signedOut": "Signed out",
+  "offline": "Bridge offline",
+  "account": "Account",
+  "budget": "Today",
+  "cooldown": "Cooldown",
+  "agy": "agy channel",
+  "agyOn": "active",
+  "agyOff": "no credential",
+  "loginHint": "Run node bridge/bin/login.mjs",
+  "updated": "Updated"
+}

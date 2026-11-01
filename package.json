@@ -1,0 +1,59 @@
+{
+  "name": "dsh-gemini-bridge",
+  "version": "1.0.0",
+  "description": "把 Gemini 双通道反代网关（网页端防封 bridge + Antigravity 上游直连）注册成 DSH 模型提供方：插件负责 bridge 进程托管、运行数据外置（~/.dsh/gemini-bridge）、浏览器路径自动发现、模型目录接入与请求侧防封（session-title 本地短路、静态模型目录零上游轮询、冷却/park 期不重试、并发闸门、密钥不落日志）。bridge 侧防封五层（TLS 指纹一致/节奏抖动/预算摊窗/分级熔断/软封异常分）与多账号轮转全部内置。",
+  "license": "MIT",
+  "author": "qwe",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "gemini",
+    "antigravity",
+    "reverse-proxy",
+    "model-provider",
+    "anti-ban"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-settings-plugins",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    },
+    "engines": {
+      "dsh": "^0.1.5-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || ^0.2.1-rc.1"
+    }
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.1",
+    "@deepseek-ai/dsh-llm": "^0.1.5-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || ^0.2.1-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || ^0.2.1-rc.1",
+    "@deepseek-ai/schemastery": ">=3.18.1"
+  },
+  "files": [
+    "lib",
+    "bridge",
+    "locale/*.json",
+    "cordis.patch.yml",
+    "README.md"
+  ]
+}
