@@ -6,3 +6,5 @@ state.json.d/
 *.log
 __pycache__/
 tools/agy-response-dump/
+
+config.json
