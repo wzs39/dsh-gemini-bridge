@@ -441,9 +441,20 @@ export class AgyPool {
   /**
    * 一个账号的配额与冷却快照（来自 pool.json，不是我们自己的计量）。
    *
-   * 形状（上游写法，原样透出，不做归一化，免得 Google 加组时丢信息）：
-   *   { [group]: { remaining, resetTime, weekly, weeklyReset, models: [{id, remaining, resetTime}] } }
-   * 冷却：{ [group]: { until, reason } }
+   * 真实结构（实测本机 pool.json，不要照上游 API 的 groups[].buckets[] 猜）：
+   *   quotas: { [group]: {
+   *       remainingFraction, resetTime,        // 5h 窗口
+   *       weeklyFraction, weeklyResetTime,     // weekly 窗口
+   *       description, updatedAt,
+   *       models: [{ modelId, displayName, remainingFraction, resetTime }]
+   *   } }
+   *
+   * 所以「桶」就是这两个字段本身，不需要另找 buckets 数组。上游 API 的
+   * groups[].buckets[] 是另一套表示（工具里能看到），但插件写进 pool.json 时
+   * 已经摊平成上面两个字段了。
+   *
+   * 组级 remaining 用 5h 窗口：它先耗尽，是「现在能不能打」的判据；weekly
+   * 单独透出，因为它决定了「这个号今天还能不能用多久」。
    */
   #quotaFor(id) {
     const raw = this.#readPoolFile().raw
@@ -453,14 +464,25 @@ export class AgyPool {
     const groups = []
     for (const [group, q] of Object.entries(entry.quotas ?? {})) {
       if (!q || typeof q !== 'object') continue
+      const five = typeof q.remainingFraction === 'number' ? q.remainingFraction : null
+      const weekly = typeof q.weeklyFraction === 'number' ? q.weeklyFraction : null
+      // 两个窗口都表示为桶，让界面和调度都能看到独立状态。
+      const buckets = []
+      if (five !== null) {
+        buckets.push({ id: `${group}-5h`, window: '5h', remaining: five, resetTime: q.resetTime ?? null })
+      }
+      if (weekly !== null) {
+        buckets.push({ id: `${group}-weekly`, window: 'weekly', remaining: weekly, resetTime: q.weeklyResetTime ?? null })
+      }
       groups.push({
         group,
-        remaining: typeof q.remainingFraction === 'number' ? q.remainingFraction : null,
+        remaining: five,
         resetTime: q.resetTime ?? null,
-        weekly: typeof q.weeklyFraction === 'number' ? q.weeklyFraction : null,
+        weekly,
         weeklyReset: q.weeklyResetTime ?? null,
         description: q.description ?? null,
         updatedAt: q.updatedAt ?? null,
+        buckets,
         models: (Array.isArray(q.models) ? q.models : []).map(m => ({
           id: m.modelId ?? m.id ?? null,
           name: m.displayName ?? m.modelId ?? null,
@@ -501,6 +523,9 @@ export class AgyPool {
           weekly: g.weekly,
           resetTime: g.resetTime,
           weeklyReset: g.weeklyReset,
+          // Per-window detail: the group summary hides "weekly full but 5h
+          // empty", which is the state that actually blocks generation.
+          buckets: g.buckets ?? [],
           cooling: Boolean(cooling),
           cooldownUntil: cooling?.until ?? null,
           cooldownReason: cooling?.reason ?? null,
@@ -549,6 +574,99 @@ export class AgyPool {
       .filter(a => a.pausedUntil > now)
       .map(a => a.pausedUntil - now)
     return waits.length ? Math.min(...waits) : 0
+  }
+
+  /**
+   * Which quota group a model draws from.
+   *
+   * Measured on this machine: gemini-* models bill the "gemini-5h"/weekly
+   * buckets, while claude-* and gpt-oss-* bill "3p-5h"/3p-weekly. The two are
+   * independent — an account can be at 100% gemini and 0% 3p at the same time,
+   * which is exactly the state that produced "Individual quota reached.
+   * Resets in 1h23m" for claude while gemini was untouched.
+   */
+  static groupForModel(model) {
+    const m = String(model ?? '').toLowerCase()
+    if (m.startsWith('claude') || m.startsWith('gpt-oss')) return '3p'
+    return 'gemini'
+  }
+
+  /**
+   * Pick the best account for a specific model, honouring per-group quota.
+   *
+   * Rotation used to be model-blind: it handed out the sticky account even when
+   * that account's 3p bucket was empty, so a claude call failed with 429 while
+   * two other accounts still had 3p quota. Now the pick is filtered by the
+   * model's own group, preferring accounts with headroom.
+   *
+   * Returns null when no account can serve that group (caller should rotate on
+   * failure or report the soonest reset).
+   */
+  pickForModel(model) {
+    const now = Date.now()
+    const want = AgyPool.groupForModel(model)
+    const candidates = []
+
+    for (const acct of this.#accounts) {
+      if (acct.pausedUntil > now) continue
+      const { groups, cooldowns } = this.#quotaFor(acct.id)
+      // pool.json 里组名是 google / anthropic / openai，而模型只区分
+      // gemini 与 3p；3p 可能是 anthropic 也可能是 openai，两者都要看。
+      const relevant = groups.filter(g => {
+        if (want === 'gemini') return g.group === 'google'
+        return g.group === 'anthropic' || g.group === 'openai'
+      })
+      // 没有任何配额数据时不能判死（老版 pool.json / 新装账号）——放进候选，
+      // 靠上游 429 兜底，别因为缺数据就把可用账号饿死。
+      if (relevant.length === 0) {
+        candidates.push({ acct, score: 0.5, known: false })
+        continue
+      }
+      let blocked = false
+      let best = -1
+      for (const g of relevant) {
+        const cooling = cooldowns.find(c => c.group === g.group && c.until && c.until > now)
+        if (cooling) continue
+        if (g.remaining !== null && g.remaining <= 0) continue
+        const frac = g.remaining === null ? 0.5 : g.remaining
+        if (frac > best) best = frac
+      }
+      if (best < 0) blocked = true
+      if (!blocked) candidates.push({ acct, score: best, known: true })
+    }
+
+    if (candidates.length === 0) return null
+
+    // 余量最多的优先，同分时按原有 cursor 顺序（保持粘滞感）。
+    candidates.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score
+      return 0
+    })
+    const winner = candidates[0].acct
+    this.#cursor = (this.#accounts.indexOf(winner) + 1) % this.#accounts.length
+    return winner
+  }
+
+  /** All accounts able to serve a model's group right now (for diagnostics). */
+  eligibleForModel(model) {
+    const want = AgyPool.groupForModel(model)
+    const now = Date.now()
+    return this.#accounts
+      .filter(a => a.pausedUntil <= now)
+      .map(a => {
+        const { groups, cooldowns } = this.#quotaFor(a.id)
+        const relevant = groups.filter(g => want === 'gemini' ? g.group === 'google' : (g.group === 'anthropic' || g.group === 'openai'))
+        const usable = relevant.length === 0 || relevant.some(g => {
+          const cooling = cooldowns.find(c => c.group === g.group && c.until && c.until > now)
+          return !cooling && (g.remaining === null || g.remaining > 0)
+        })
+        return {
+          id: a.id,
+          email: a.email,
+          usable,
+          remaining: relevant.length ? Math.max(...relevant.map(g => g.remaining ?? 0)) : null,
+        }
+      })
   }
 
   /** Park one account after a hard-stop signal. */

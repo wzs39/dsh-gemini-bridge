@@ -62,67 +62,164 @@ class CDPSession extends EventEmitter {
   #ws
   #seq = 0
   #pending = new Map()
-  #buf = ''
+  /**
+   * Raw byte buffer. WebSocket frames are length-prefixed, so we must keep bytes
+   * (not decoded text) — a multi-byte UTF-8 character or a split payload would
+   * be corrupted by per-chunk toString().
+   */
+  #buf = Buffer.alloc(0)
+  /** Reassembles fragmented messages (opcode 0 continuation frames). */
+  #fragments = []
 
   constructor(ws) {
     super()
     this.#ws = ws
-    ws.on('data', chunk => this.#onData(chunk.toString()))
-    ws.on('close', () => this.emit('close'))
+    ws.on('data', chunk => this.#onData(chunk))
+    ws.on('close', () => {
+      for (const { reject } of this.#pending.values()) {
+        reject(new Error('CDP socket closed'))
+      }
+      this.#pending.clear()
+      this.emit('close')
+    })
     ws.on('error', e => this.emit('error', e))
   }
 
-  #onData(raw) {
-    this.#buf += raw
-    // WebSocket frames are length-prefixed in our simple implementation;
-    // we rely on the fact that Node's http module + CDP uses chunked HTTP upgrade.
-    // A robust parser is not needed here: the CDP server sends complete JSON frames.
-    // We look for complete JSON objects by counting braces.
-    let start = 0
-    while (true) {
-      const i = this.#buf.indexOf('{', start)
-      if (i < 0) { this.#buf = ''; break }
-      let depth = 0, j = i
-      for (; j < this.#buf.length; j++) {
-        if (this.#buf[j] === '{') depth++
-        else if (this.#buf[j] === '}') { depth--; if (depth === 0) break }
+  /**
+   * Parse the WebSocket wire format.
+   *
+   * The previous implementation scanned the raw stream for '{' … '}' and counted
+   * brace depth. That cannot work for this protocol: a single CDP reply carries
+   * a JSON string whose VALUE contains braces (Gemini's f.req payloads are
+   * nested escaped JSON), so the depth counter desynchronises, no message is
+   * ever cut, the pending promise never settles and Runtime.evaluate hangs
+   * forever. Small replies (token scrapes) happened to contain no braces inside
+   * strings and therefore worked — which is exactly why generation looked like
+   * a hang while token reads looked fine.
+   */
+  #onData(chunk) {
+    this.#buf = this.#buf.length ? Buffer.concat([this.#buf, chunk]) : chunk
+
+    for (;;) {
+      if (this.#buf.length < 2) return
+      const b0 = this.#buf[0]
+      const b1 = this.#buf[1]
+      const fin = (b0 & 0x80) !== 0
+      const opcode = b0 & 0x0f
+      const masked = (b1 & 0x80) !== 0
+      let len = b1 & 0x7f
+      let offset = 2
+
+      if (len === 126) {
+        if (this.#buf.length < 4) return
+        len = this.#buf.readUInt16BE(2)
+        offset = 4
+      } else if (len === 127) {
+        if (this.#buf.length < 10) return
+        const hi = this.#buf.readUInt32BE(2)
+        const lo = this.#buf.readUInt32BE(6)
+        len = hi * 0x100000000 + lo
+        offset = 10
       }
-      if (depth !== 0) { this.#buf = this.#buf.slice(i); break }
-      const text = this.#buf.slice(i, j + 1)
-      start = j + 1
-      try {
-        const msg = JSON.parse(text)
-        if (msg.id != null) {
-          const entry = this.#pending.get(msg.id)
-          if (entry) {
-            this.#pending.delete(msg.id)
-            if (msg.error) entry.reject(new Error(msg.error.message ?? JSON.stringify(msg.error)))
-            else entry.resolve(msg.result)
-          }
-        } else {
-          this.emit('event', msg.method, msg.params)
+
+      let maskKey = null
+      if (masked) {
+        if (this.#buf.length < offset + 4) return
+        maskKey = this.#buf.subarray(offset, offset + 4)
+        offset += 4
+      }
+
+      if (this.#buf.length < offset + len) return  // wait for the rest
+      let payload = this.#buf.subarray(offset, offset + len)
+      this.#buf = this.#buf.subarray(offset + len)
+
+      if (maskKey) {
+        // Server->client frames are never masked per RFC 6455, but unmask
+        // defensively so a misbehaving peer cannot corrupt the payload.
+        const out = Buffer.allocUnsafe(payload.length)
+        for (let i = 0; i < payload.length; i++) {
+          out[i] = payload[i] ^ maskKey[i % 4]
         }
-      } catch { /* malformed frame, skip */ }
-      if (start >= this.#buf.length) { this.#buf = ''; break }
+        payload = out
+      }
+
+      if (opcode === 0x8) {          // close
+        this.#ws.destroy()
+        return
+      }
+      if (opcode === 0x9) {          // ping -> pong
+        this.#writeFrame(0xA, payload)
+        continue
+      }
+      if (opcode === 0xA) continue   // pong, ignore
+
+      if (opcode === 0x0) {          // continuation
+        this.#fragments.push(payload)
+        if (!fin) continue
+        payload = Buffer.concat(this.#fragments)
+        this.#fragments = []
+      } else {
+        this.#fragments = fin ? [] : [payload]
+        if (!fin) continue
+      }
+
+      this.#dispatch(payload.toString('utf8'))
     }
+  }
+
+  #dispatch(text) {
+    let msg
+    try { msg = JSON.parse(text) } catch { return }  // non-JSON control frame
+    if (msg.id != null) {
+      const entry = this.#pending.get(msg.id)
+      if (!entry) return
+      this.#pending.delete(msg.id)
+      if (msg.error) entry.reject(new Error(msg.error.message ?? JSON.stringify(msg.error)))
+      else entry.resolve(msg.result)
+      return
+    }
+    this.emit('event', msg.method, msg.params)
+  }
+
+  /**
+   * Write one masked client frame.
+   *
+   * RFC 6455 requires client frames to be masked, and the mask key must be
+   * applied per byte. The old code wrote "mask = 0x00" which is technically a
+   * valid no-op mask, but it also only handled two length classes and produced
+   * a malformed header for payloads >= 64KB (the 64-bit length form was never
+   * written), silently breaking large Runtime.evaluate calls.
+   */
+  #writeFrame(opcode, payload) {
+    const len = payload.length
+    let header
+    if (len < 126) {
+      header = Buffer.allocUnsafe(6)
+      header[0] = 0x80 | opcode
+      header[1] = 0x80 | len
+      header.writeUInt32BE(0, 2)
+    } else if (len < 65536) {
+      header = Buffer.allocUnsafe(8)
+      header[0] = 0x80 | opcode
+      header[1] = 0x80 | 126
+      header.writeUInt16BE(len, 2)
+      header.writeUInt32BE(0, 4)
+    } else {
+      header = Buffer.allocUnsafe(14)
+      header[0] = 0x80 | opcode
+      header[1] = 0x80 | 127
+      header.writeUInt32BE(Math.floor(len / 0x100000000), 2)
+      header.writeUInt32BE(len >>> 0, 6)
+      header.writeUInt32BE(0, 10)
+    }
+    this.#ws.write(Buffer.concat([header, payload]))
   }
 
   send(method, params = {}) {
     const id = ++this.#seq
     return new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject })
-      const frame = JSON.stringify({ id, method, params })
-      // Minimal WS framing for a text frame ≤ 64KB
-      const payload = Buffer.from(frame)
-      const len = payload.length
-      let header
-      if (len < 126) {
-        header = Buffer.from([0x81, 0x80 | len, 0, 0, 0, 0])
-      } else {
-        header = Buffer.from([0x81, 0x80 | 126, (len >> 8) & 0xff, len & 0xff, 0, 0, 0, 0])
-      }
-      // XOR with 0x00 mask (key = [0,0,0,0]) = no-op
-      this.#ws.write(Buffer.concat([header, payload]))
+      this.#writeFrame(0x1, Buffer.from(JSON.stringify({ id, method, params })))
     })
   }
 

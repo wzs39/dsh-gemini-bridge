@@ -119,6 +119,8 @@ export class AgyClient {
       defaultModel: this.#config.agy?.defaultModel ?? 'gemini-3.8-flash',
     })
     const body = JSON.stringify(envelope)
+    // 请求里的模型名（客户端选择器，不是上游 id）：决定它吃哪一族配额。
+    const wantedModel = payload.model ?? this.#config.agy?.defaultModel ?? ''
 
     if (!this.#pool) {
       yield* this.#completeSingle(body)
@@ -126,12 +128,21 @@ export class AgyClient {
     }
 
     // Pool mode: sticky rotation with per-account parks.
+    // 模型感知：claude/gpt-oss 吃 3p 桶，gemini 吃 gemini 桶，两者独立。
+    // 之前是 model-blind，挑到 3p 已耗尽的账号就报 429，而其它账号 3p 还有
+    // 余量 —— 那正是 "Individual quota reached. Resets in 1h23m" 的来源。
+    const tried = new Set()
     for (;;) {
-      const account = this.#pool.pick()
+      const account = this.#pool.pickForModel?.(wantedModel) ?? this.#pool.pick()
       if (!account) {
         const ms = this.#pool.nextUnpauseInMs() || 60_000
         throw new AgyAllParkedError(ms)
       }
+      // 全都试过仍失败：不要无限转圈，把最后一次错误抛出去。
+      if (tried.has(account.id) && tried.size >= this.#pool.count) {
+        throw new AgyAllParkedError(this.#pool.nextUnpauseInMs() || 60_000)
+      }
+      tried.add(account.id)
       try {
         yield* this.#attemptWithAccount(account, body)
         return

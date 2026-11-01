@@ -1,0 +1,50 @@
+fix(web): CDP transport dropped messages with braces; token scrape picked wrong fields
+
+The web channel never actually served a completion. Three independent defects,
+each reproduced and measured; fixing only one or two leaves it broken.
+
+1. WEBSOCKET FRAMING (the real reason everything looked hung)
+   cdp.mjs never parsed the WebSocket wire format. It concatenated the raw
+   stream and scanned for '{' … '}', counting brace depth to cut JSON objects.
+   A CDP reply whose JSON *string value* contains braces — and Gemini's f.req
+   responses are nested escaped JSON, so they contain thousands — desynchronises
+   that counter. No message was ever cut, the pending promise never settled, and
+   Runtime.evaluate waited forever.
+   That is why token scrapes appeared to work (their replies carry no braces
+   inside strings) while generation appeared to hang: same transport, different
+   payload shape.
+   Replaced with a real RFC 6455 reader: 7/16/64-bit length forms, masked-payload
+   handling, continuation-frame reassembly, ping→pong, and close settling every
+   pending call instead of leaving it hanging. The writer now also emits the
+   64-bit length form for payloads >= 64KB; the old code fell into the 16-bit
+   branch for everything >= 126 bytes and produced a header that lied.
+
+2. SNlM0e COULD NOT MATCH A VALID TOKEN
+   The token is "<22-char id>:<epoch millis>" and the pattern restricted it to
+   [\w\-_], which excludes the colon. Every good page therefore raised
+   "SNlM0e not found — session expired; run node bin/login.mjs" even though the
+   session was fine. Now captured as the whole quoted string.
+
+3. BUILD LABEL CAME FROM THE WRONG FIELD
+   "FdrFJe" appears several times in the fetched HTML and the first hit is a bare
+   number (measured: -7730566936813324387). The real label is the
+   "boq_gemini-web-uiserver_20261029.22_p0" form. Sending the number did not
+   fail loudly — StreamGenerate simply hung. scrapePageTokens now reads
+   window.WIZ_global_data first (authoritative, and fresher than any re-fetched
+   HTML because the SPA refreshes it in place), falling back to an HTML scrape
+   whose build-label pattern is anchored on the boq_/prod- prefix.
+
+Verified live after all three fixes, each account doing a real completion:
+   pro1 zishuo391435@gmail.com   4729ms  16933 bytes  PONG
+   pro2 wang391435@gmail.com     3488ms  16957 bytes  PONG
+   pro3 zishuowang35@gmail.com   4578ms  16932 bytes  PONG
+
+Tests: +15 (cdp.test.mjs pins the framing invariants and both length forms;
+session-tokens.test.mjs pins the token patterns and the request shape).
+Suite 107/107 green.
+
+Also adds the probes that produced this evidence: matrix-test (account x model),
+probe-project-sharing (per-account quota vs shared project), probe-quota-raw
+(5h/weekly buckets), verify-unlock-proxy (region-field stripping through the
+mitmproxy addon), verify-one-web (single-account end-to-end), extract-cookies
+(DPAPI cookie decrypt, documents why cookie copying cannot work).

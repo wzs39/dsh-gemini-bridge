@@ -290,4 +290,101 @@ describe('AgyPool (dsh-agy-link pool.json consumer)', () => {
     assert.deepEqual(d.quota.groups, [], 'no quota data -> empty groups')
     assert.equal(d.usable, true, 'credential present and not parked -> usable')
   })
+
+  it('the 5h and weekly windows surface as separate buckets', () => {
+    // Real pool.json shape (verified on this machine): a group carries
+    // remainingFraction (5h window) and weeklyFraction (weekly window) as two
+    // flat fields — there is NO buckets[] array in the file. The 5h field is
+    // what decides "can I generate right now"; weekly decides "how long will
+    // this account last". Collapsing them hides the blocking state.
+    writePoolFile([
+      {
+        id: 'acc_buckets', alias: 'B', email: 'b@example.com', enabled: true,
+        dir: path.join(tmpDir, 'acc_b'),
+        quotas: {
+          anthropic: {
+            remainingFraction: 0,
+            resetTime: '2026-11-01T19:48:16Z',
+            weeklyFraction: 1,
+            weeklyResetTime: '2026-11-08T00:26:24Z',
+          },
+        },
+      },
+    ])
+    const p = new AgyPool({ config: { agy: { poolFile: path.join(tmpDir, 'pool.json') } } })
+    const g = p.describeAll()[0].quota.groups[0]
+    assert.equal(g.buckets.length, 2, 'both windows surface as buckets')
+    const five = g.buckets.find(b => b.window === '5h')
+    const weekly = g.buckets.find(b => b.window === 'weekly')
+    assert.equal(five.remaining, 0, '5h window empty')
+    assert.equal(weekly.remaining, 1, 'weekly window still full')
+    // The group's effective remaining MUST follow the 5h window: weekly full but
+    // 5h empty means generation is blocked right now.
+    assert.equal(g.remaining, 0, 'group remaining follows the 5h window')
+    assert.equal(g.usable === undefined || g.usable === false, true, 'an empty 5h window blocks the group')
+  })
+
+  it('groupForModel routes claude/gpt-oss to 3p and gemini to gemini', () => {
+    assert.equal(AgyPool.groupForModel('gemini-3.8-flash-medium'), 'gemini')
+    assert.equal(AgyPool.groupForModel('gemini-3-flash'), 'gemini')
+    assert.equal(AgyPool.groupForModel('claude-sonnet-4-6'), '3p')
+    assert.equal(AgyPool.groupForModel('claude-opus-4-6-thinking'), '3p')
+    assert.equal(AgyPool.groupForModel('gpt-oss-120b-medium'), '3p')
+  })
+
+  it('pickForModel skips an account whose model bucket is exhausted', () => {
+    // The live failure this fixes: two accounts had 3p quota, one was empty,
+    // and a model-blind pick handed out the empty one -> 429 "Resets in 1h23m"
+    // even though the model was available elsewhere.
+    fs.mkdirSync(path.join(tmpDir, 'acc_b', '.gemini', 'antigravity-cli'), { recursive: true })
+    writePoolFile([
+      {
+        id: 'acc_3p_empty', alias: 'Empty3p', email: 'empty@example.com', enabled: true,
+        dir: path.join(tmpDir, 'acc_b'),
+        quotas: {
+          anthropic: { remainingFraction: 0, weeklyFraction: 1 },
+          google: { remainingFraction: 1, weeklyFraction: 1 },
+        },
+        cooldowns: {},
+      },
+      {
+        id: 'acc_3p_ok', alias: 'Ok3p', email: 'ok@example.com', enabled: true,
+        dir: path.join(tmpDir, 'acc_b'),
+        quotas: {
+          anthropic: { remainingFraction: 0.9, weeklyFraction: 0.8 },
+          google: { remainingFraction: 0.2, weeklyFraction: 0.9 },
+        },
+        cooldowns: {},
+      },
+    ])
+    const p = new AgyPool({ config: { agy: { poolFile: path.join(tmpDir, 'pool.json') } } })
+
+    // claude must skip the 3p-empty account...
+    const forClaude = p.pickForModel('claude-sonnet-4-6')
+    assert.equal(forClaude.id, 'acc_3p_ok', 'claude must be routed to the account with 3p quota')
+
+    // ...while gemini prefers the account with more gemini headroom.
+    const forGemini = p.pickForModel('gemini-3.8-flash-medium')
+    assert.equal(forGemini.id, 'acc_3p_empty', 'gemini picks by gemini quota, not 3p')
+  })
+
+  it('eligibleForModel reports per-account availability for a model family', () => {
+    fs.mkdirSync(path.join(tmpDir, 'acc_b', '.gemini', 'antigravity-cli'), { recursive: true })
+    writePoolFile([
+      {
+        id: 'a1', alias: 'A1', email: 'a1@example.com', enabled: true,
+        dir: path.join(tmpDir, 'acc_b'),
+        quotas: { anthropic: { remainingFraction: 0, weeklyFraction: 0.5 } },
+      },
+      {
+        id: 'a2', alias: 'A2', email: 'a2@example.com', enabled: true,
+        dir: path.join(tmpDir, 'acc_b'),
+        quotas: { anthropic: { remainingFraction: 0.5, weeklyFraction: 0.5 } },
+      },
+    ])
+    const p = new AgyPool({ config: { agy: { poolFile: path.join(tmpDir, 'pool.json') } } })
+    const rows = p.eligibleForModel('claude-sonnet-4-6')
+    assert.equal(rows.find(r => r.id === 'a1').usable, false, 'empty 3p 5h window is not usable for claude')
+    assert.equal(rows.find(r => r.id === 'a2').usable, true)
+  })
 })

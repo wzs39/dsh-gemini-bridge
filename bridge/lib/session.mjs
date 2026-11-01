@@ -247,11 +247,47 @@ export class Session {
       await this.#waitForOrigin(this.#page, origin)
     }
 
-    // Fetch the app page from inside the browser to get the rendered HTML.
+    // PRIMARY: WIZ_global_data on the live page.
+    //
+    // This is the authoritative source. Scraping the fetched HTML instead is
+    // fragile in two measured ways:
+    //   - "FdrFJe" appears multiple times in the document; taking the first hit
+    //     yields a bare number like "-7730566936813324387" instead of the real
+    //     build label "boq_gemini-web-uiserver_20261029.22_p0", and the request
+    //     then hangs instead of failing loudly.
+    //   - the tokens are refreshed in-place by the SPA, so the live globals are
+    //     strictly fresher than any HTML we could re-fetch.
+    const wiz = await evaluate(this.#page, `
+      (() => {
+        const w = window.WIZ_global_data || null;
+        if (!w) return null;
+        return JSON.stringify({
+          sn: w.SNlM0e || null,
+          bl: w.cfb2h || w.FdrFJe || null,
+        });
+      })()
+    `).catch(() => null)
+
+    if (wiz) {
+      try {
+        const parsed = JSON.parse(wiz)
+        if (parsed.sn) {
+          this.#pageTokens = {
+            snlm0e: parsed.sn,
+            bl: parsed.bl ?? '',
+            scrapedAt: Date.now(),
+          }
+          return this.#pageTokens
+        }
+      } catch { /* fall through to HTML scrape */ }
+    }
+
+    // FALLBACK: re-fetch the app page and parse it. Kept for the case where the
+    // globals are not populated yet (very early after navigation).
     const result = await evaluate(this.#page, `
       (async () => {
         const r = await fetch('${origin}${APP_PATH}', {
-          headers: { 'accept': 'text/html' },
+          headers: { accept: 'text/html' },
           credentials: 'include',
         });
         return r.ok ? r.text() : null;
@@ -260,9 +296,17 @@ export class Session {
 
     if (!result) throw new Error('scrape returned null -- cookies may be expired')
 
-    const snlm0eMatch = result.match(/"SNlM0e":"([\w\-_]+)"/)
-    const blMatch = result.match(/"FdrFJe":"([\w.\-]+)"/)
-      ?? result.match(/[?&]bl=([\w.\-]+)/)
+    // SNlM0e is "<22-char id>:<epoch millis>" — the colon is part of the token.
+    // A [\w\-_]+ class silently fails on it, and the failure message then claims
+    // "session expired" even though the session is perfectly fine (measured:
+    // value "AIaPT3O53kHzJApYsqufSVbxr7aP:1793564141603", 42 chars).
+    // Match the quoted string as a whole instead of guessing its alphabet.
+    const snlm0eMatch = result.match(/"SNlM0e":"([^"]+)"/)
+    // Build label must be the "boq_gemini-web-..." form; a bare digit run is the
+    // wrong field. (?:...) keeps the capture on the right group.
+    const blMatch = result.match(/"FdrFJe":"((?:boq_|prod-)[^"]+)"/)
+      ?? result.match(/"cfb2h":"([^"]+)"/)
+      ?? result.match(/[?&]bl=(boq_[^"&]+)/)
 
     if (!snlm0eMatch) {
       // The page was probably a login redirect.
