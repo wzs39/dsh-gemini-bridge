@@ -78,6 +78,37 @@ agy CLI 报「not currently available in your location」时，实际可能是�
 真正的判决在生成端点：200 = 有资格（addon 能救）；403 `VALIDATION_REQUIRED` =
 要账号验证（addon 救不了，抹字段只会让 CLI 启动后照样失败）。
 
+#### 第一类：addon 救得了，但要「常驻 + 注入」两件事同时成立
+
+`agy_unlock_addon.py` 本身是对的，它只在 mitmproxy 监听器**活着**且**真的被
+agy 用上**时生效。这两条任一不成立，症状完全一样——CLI 照样吐原始地区墙，
+看上去像「addon 无效」：
+
+- **监听器没在跑**：重启、被杀、任务没注册，任何一次都会让它消失。
+  `tools/unlock-keepalive.ps1` 负责自查自愈（幂等，端口没监听才拉起）。
+- **代理没注入到 agy 进程**：手动用 `agy-unlock.cmd` 包一层是好的，但 DSH 经
+  `dsh-agy-link` 拉起 agy 时不走那个 wrapper。插件实际这样拼环境：
+
+  ```js
+  const effectiveProxy = account?.proxyUrl || cfg.proxyUrl || detectSystemProxy() || void 0;
+  const env = { ...process.env, ...proxyEnvFor(effectiveProxy) };
+  ```
+
+  所以持久杠杆是 `pool.json` 每个账号的 `proxyUrl`：只起代理不改它，DSH 拉起的
+  agy 依然裸奔。
+
+一条命令装齐（详见 [`bridge/tools/README-unlock.md`](bridge/tools/README-unlock.md)）：
+
+```powershell
+cd bridge/tools
+powershell -ExecutionPolicy Bypass -File .\unlock-install.ps1   # 起代理 + 注册自愈
+python set-pool-proxy.py --apply                                 # 写 pool.json
+powershell -ExecutionPolicy Bypass -File .\unlock-verify.ps1 -LiveTest   # 真生成一次
+```
+
+`unlock-verify.ps1` 把 CA 信任、监听器、pool 注入、真实生成**分段**验证——
+失败在哪一层一目了然，不用猜。改完需重启 DSH，插件才会重读 pool.json。
+
 第二种情况的处理：
 
 ```bash

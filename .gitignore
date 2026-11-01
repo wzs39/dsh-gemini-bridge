@@ -1,3 +1,12 @@
 node_modules/
 *.tgz
 package-lock.json
+
+# Python bytecode from bridge/tools
+__pycache__/
+*.pyc
+
+# Runtime artifacts from bridge/tools/unlock-*.ps1
+# (the addon writes captures here; logs are per-machine)
+bridge/tools/agy-response-dump/
+bridge/tools/*.log
