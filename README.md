@@ -80,12 +80,28 @@ node <插件目录>/bridge/bin/login.mjs --account default
 插件设置（DSH 设置页）：`noRetry`（默认开——冷却期绝不重试）、
 `maxConcurrent`（默认 2）、`models` 静态清单、进程托管开关等。
 
+## agy 多账号池（复用 dsh-agy-link）
+
+本机装着 DSH 的 agy-link 插件并维护着 `~/.dsh/agy-accounts/pool.json` 账号池时，
+bridge 的 agy 通道**自动切换为池模式**（无需配置）：
+
+- 池内每个 enabled 账号一个凭据源（`acc_*` 目录各自的 token 文件；
+  `acc_primary` 走系统 HOME/凭据管理器）
+- **粘性轮转**：当前账号用到 429 配额（park 1h）或 refresh 死亡（park 12h）
+  才切下一个；全部 park → 429 + 最早解除时间
+- bridge 只读 pool.json、只写自己的 tmp 缓存——**绝不与 agy-link 抢写**凭据槽
+  与 pool 状态；agy-link 里新增/删除账号，bridge 重启即跟随
+- 状态查看：`GET /api/agy/pool`（逐账号 token/park 状态）、
+  `POST /api/agy/resume?id=<accId>`（人工重登后恢复）、usage 卡片 agy 行
+
+无 pool.json 时回落到单账号模式（系统默认 agy 凭据），行为与之前一致。
+
 ## 结构与已知边界
 
 ```
 lib/index.js          Host 半身：进程托管、配置 seed、provider 注册、usage 路由
 lib/openai-adapter.js DSH 词表 <-> OpenAI SSE（session-title 短路/闸门/透传拒绝）
-lib/client.js         浏览器半身：usage 卡片
+lib/client.js         浏览器半身：usage 卡片（含 agy 池逐账号状态行）
 bridge/               网关本体（Node ≥22，零第三方依赖，可脱离插件独立运行）
 bridge/tools/         探针与应急脚本
 ```

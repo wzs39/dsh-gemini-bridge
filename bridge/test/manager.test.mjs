@@ -11,6 +11,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { AccountManager } from '../lib/manager.mjs'
+import { AgyPool } from '../lib/agytoken.mjs'
 
 function makeConfig() {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mgr-test-'))
@@ -113,5 +114,101 @@ describe('AccountManager', () => {
   it('describeAll exposes no cookie secrets', () => {
     const text = JSON.stringify(manager.describeAll())
     assert.ok(!text.includes('Secure-1PSID='), 'health output must not carry cookie values')
+  })
+})
+
+describe('AgyPool (dsh-agy-link pool.json consumer)', () => {
+  let tmpDir
+  let pool
+
+  function writePoolFile(accounts) {
+    fs.writeFileSync(path.join(tmpDir, 'pool.json'), JSON.stringify({
+      version: 1, mode: 'sequential',
+      accounts,
+      activeAccountIds: {}, primaryAccountId: accounts[0]?.id ?? null,
+    }))
+  }
+
+  before(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-pool-'))
+    // Two enabled accounts (one systemHome, one dir-based) + one disabled.
+    fs.mkdirSync(path.join(tmpDir, 'acc_b', '.gemini', 'antigravity-cli'), { recursive: true })
+    fs.writeFileSync(
+      path.join(tmpDir, 'acc_b', '.gemini', 'antigravity-cli', 'antigravity-oauth-token'),
+      JSON.stringify({ token: { access_token: 'a_b', refresh_token: 'r_b', expiry: new Date(Date.now() + 3600_000).toISOString() }, auth_method: 'consumer' }),
+    )
+    writePoolFile([
+      { id: 'acc_primary', alias: 'Primary', email: 'p@example.com', systemHome: true, enabled: true },
+      { id: 'acc_b', alias: 'Backup', email: 'b@example.com', dir: path.join(tmpDir, 'acc_b'), enabled: true },
+      { id: 'acc_off', alias: 'Off', dir: path.join(tmpDir, 'acc_off'), enabled: false },
+    ])
+    pool = new AgyPool({ config: { agy: { poolFile: path.join(tmpDir, 'pool.json') } } })
+  })
+
+  after(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('loads enabled accounts only', () => {
+    assert.equal(pool.count, 2)
+    const ids = pool.describeAll().map(a => a.id)
+    assert.ok(ids.includes('acc_primary') && ids.includes('acc_b'))
+    assert.ok(!ids.includes('acc_off'))
+  })
+
+  it('dir-based account reads its token file; systemHome reports not-loaded in test env', () => {
+    const d = pool.describeAll()
+    const b = d.find(a => a.id === 'acc_b')
+    assert.equal(b.token.loaded, true)
+    const p = d.find(a => a.id === 'acc_primary')
+    // systemHome resolves to the real user HOME; on CI/test machines without
+    // an agy login it is simply not loaded -- the status stays honest.
+    assert.equal(typeof p.token.loaded, 'boolean')
+  })
+
+  it('describeAll carries no token material', () => {
+    const text = JSON.stringify(pool.describeAll())
+    assert.ok(!text.includes('a_b') && !text.includes('r_b'), 'token values must never appear in status output')
+  })
+
+  it('round-robins and preserves pause across reload()', () => {
+    const first = pool.pick()
+    assert.ok(first)
+    pool.pause(first, 60_000, 'test-park')
+    assert.equal(pool.pick().id !== first.id || pool.count === 1, true)
+    // reload(): same file, pause state survives for surviving ids.
+    pool.reload()
+    const d = pool.describeAll().find(a => a.id === first.id)
+    assert.ok(d.pausedUntil, 'pause must survive reload')
+    // cleanup
+    pool.resume(first.id)
+  })
+
+  it('resume clears the park', () => {
+    const a = pool.pick()
+    pool.pause(a, 60_000, 'x')
+    assert.ok(pool.resume(a.id))
+    assert.equal(pool.describeAll().find(x => x.id === a.id).pausedUntil, null)
+  })
+
+  it('all parked -> pick() returns null with a wait estimate', () => {
+    // Park every account through a client-style pause on real references:
+    // pick twice to capture both account objects (pool has exactly 2 here).
+    const seen = new Set()
+    for (let i = 0; i < pool.count; i++) {
+      const a = pool.pick()
+      if (a) { seen.add(a.id); pool.pause(a, 60_000, 'x') }
+    }
+    assert.equal(seen.size, pool.count, 'every account should have been parked')
+    assert.equal(pool.pick(), null, 'no account may be picked while all are parked')
+    assert.ok(pool.nextUnpauseInMs() > 0, 'nextUnpauseInMs reflects the soonest release')
+    for (const id of seen) pool.resume(id)
+    assert.ok(pool.pick(), 'after resume, picks work again')
+  })
+
+  it('missing pool file -> empty pool (serve falls back to single mode)', () => {
+    const empty = new AgyPool({ config: { agy: { poolFile: path.join(tmpDir, 'nope.json') } } })
+    assert.equal(empty.count, 0)
+    assert.equal(empty.pick(), null)
   })
 })

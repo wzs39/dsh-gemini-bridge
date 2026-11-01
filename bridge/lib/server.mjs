@@ -192,6 +192,32 @@ export function createServer(config, client) {
       return
     }
 
+    // agy pool status (read-only view of the multi-account rotation state).
+    if (req.method === 'GET' && url.pathname === '/api/agy/pool') {
+      const agy = client.describeAll?.().agy ?? null
+      if (!agy?.pool) {
+        json(res, 404, { error: { message: 'agy pool not active (single-account mode or channel disabled)' } })
+        return
+      }
+      json(res, 200, { count: agy.pool.count, accounts: agy.pool.accounts })
+      return
+    }
+
+    // Resume one parked agy account (human re-logged it via the agy CLI).
+    if (req.method === 'POST' && url.pathname === '/api/agy/resume') {
+      const id = url.searchParams.get('id')
+      const agy = client.describeAll?.().agy
+      const poolOk = Boolean(agy?.pool)
+      if (!poolOk || !id) {
+        json(res, 404, { error: { message: 'agy pool not active or missing ?id=' } })
+        return
+      }
+      // resume lives on the pool instance; reach it through the client.
+      const ok = client.agyResume?.(id) ?? false
+      json(res, ok ? 200 : 404, ok ? { ok: true, id } : { error: { message: 'account id not in pool' } })
+      return
+    }
+
     if (req.method === 'POST' && (url.pathname === '/v1/chat/completions' || url.pathname === '/v1/responses')) {
       let body = ''
       for await (const chunk of req) body += chunk

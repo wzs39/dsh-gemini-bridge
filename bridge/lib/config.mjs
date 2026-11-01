@@ -72,6 +72,7 @@ const DEFAULTS = {
     project: 'aicode-consumers',
     defaultModel: 'gemini-3.8-flash',
     tokenFile: null, // null -> ~/.gemini/antigravity-cli/antigravity-oauth-token
+    poolFile: null, // null -> auto: use ~/.dsh/agy-accounts/pool.json when present, else single-account mode
   },
   paths: {
     logs: path.join(ROOT, 'logs'),

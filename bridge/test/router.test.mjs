@@ -31,6 +31,7 @@ function stubWeb({ text = 'WEB', error = null } = {}) {
 function stubAgy({ events = null, error = null } = {}) {
   return {
     describe: () => ({ enabled: true, models: ['claude-sonnet-4-6'], token: { loaded: true } }),
+    poolResume: () => false,
     async *complete(_payload) {
       if (error) throw error
       for (const e of events ?? [{ delta: { content: 'AGY' }, done: false }, { delta: {}, finishReason: 'stop', usage: { prompt_tokens: 1 }, done: true }]) {

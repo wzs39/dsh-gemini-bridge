@@ -27,7 +27,8 @@
     "enabled": true,
     "project": "aicode-consumers",
     "defaultModel": "gemini-3.8-flash",
-    "tokenFile": null
+    "tokenFile": null,
+    "poolFile": null
   },
   "behaviour": {
     "keepAliveSeconds": 900,

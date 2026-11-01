@@ -97,6 +97,11 @@ export class Router {
   nextUnpauseInMs() {
     return this.#webClient?.manager?.nextUnpauseInMs?.() ?? 0
   }
+
+  /** Resume one parked agy pool account (human re-login happened). */
+  agyResume(id) {
+    return this.#agyClient?.poolResume?.(id) ?? false
+  }
 }
 
 /** async-generator tail: first (already-pulled) value, then the rest. */

@@ -22,6 +22,8 @@
  */
 
 import { buildRequest, mapChunk, mapFinishReason } from './agyconvert.mjs'
+import { AgyAllParkedError } from './agytoken.mjs'
+import { pauseFor } from './detect.mjs'
 
 const BASE = 'https://daily-cloudcode-pa.googleapis.com'
 const UA = 'antigravity/4.3.0 windows/amd64'
@@ -49,26 +51,48 @@ export class AgyUpstreamError extends Error {
 
 export class AgyClient {
   #config
-  #tokens
+  #tokens        // single-account AgyTokenStore (legacy) OR null when pool is on
+  #pool          // AgyPool (multi-account) OR null
   #project
 
-  constructor({ config, tokens }) {
+  constructor({ config, tokens, pool }) {
     this.#config = config
-    this.#tokens = tokens
+    this.#tokens = tokens ?? null
+    this.#pool = pool ?? null
     this.#project = config.agy?.project ?? 'aicode-consumers'
   }
 
   describe() {
+    if (this.#pool) {
+      return {
+        enabled: true,
+        models: AGY_MODELS,
+        pool: {
+          count: this.#pool.count,
+          accounts: this.#pool.describeAll(),
+        },
+      }
+    }
     return { enabled: true, models: AGY_MODELS, token: this.#tokens.describe() }
+  }
+
+  /** Resume one parked pool account (proxied for the HTTP route). */
+  poolResume(id) {
+    return this.#pool?.resume?.(id) ?? false
   }
 
   /**
    * One completion. Yields OpenAI-shaped events:
    *   { delta, finishReason?, usage?, done }
    *
-   * 401 exactly once -> forceRefresh + replay (the whole request is replayed;
-   * agy upstream is idempotent per requestId and the caller has not seen any
-   * bytes yet because the first mapped event is pre-fetched).
+   * Account handling:
+   *   - pool mode: pick() a live account; 401 -> that account's forceRefresh
+   *     + replay (same identity, token was stale); 429 quota -> park that
+   *     account (pauseFor('throttled')) and sticky-rotate to the next; all
+   *     parked -> AgyAllParkedError with the soonest release.
+   *   - legacy single-token mode: exactly the old 401-retry behavior.
+   *   - region gate: never involved -- this channel talks to the upstream
+   *     directly; the lock lives only in the CLI (verified live).
    */
   async *complete(payload) {
     const { envelope } = buildRequest({
@@ -78,6 +102,80 @@ export class AgyClient {
     })
     const body = JSON.stringify(envelope)
 
+    if (!this.#pool) {
+      yield* this.#completeSingle(body)
+      return
+    }
+
+    // Pool mode: sticky rotation with per-account parks.
+    for (;;) {
+      const account = this.#pool.pick()
+      if (!account) {
+        const ms = this.#pool.nextUnpauseInMs() || 60_000
+        throw new AgyAllParkedError(ms)
+      }
+      try {
+        yield* this.#attemptWithAccount(account, body)
+        return
+      } catch (err) {
+        const isQuota = err instanceof AgyUpstreamError
+          && (err.status === 429 || err.code === 'RESOURCE_EXHAUSTED')
+        const isDead = err instanceof AgyUpstreamError && err.status === 401 && err.code === 'DEAD_REFRESH'
+        if (isQuota || isDead) {
+          // Park and rotate. pauseFor('throttled') = 1h for quota; auth-dead
+          // gets the longer auth window (12h) -- a human must re-login.
+          this.#pool.pause(account, pauseFor(isDead ? 'auth_expired' : 'throttled'), err.message)
+          continue
+        }
+        throw err
+      }
+    }
+  }
+
+  async *#attemptWithAccount(account, body) {
+    let attempt = 0
+    for (;;) {
+      attempt += 1
+      const access = await account.tokens.accessToken()
+      const res = await fetch(`${BASE}/v1internal:streamGenerateContent?alt=sse`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${access}`,
+          'content-type': 'application/json',
+          requesttype: 'agent',
+          'user-agent': UA,
+        },
+        body,
+        signal: AbortSignal.timeout(this.#config.behaviour?.completionTimeoutMs ?? 120000),
+      })
+
+      if (res.status === 401 && attempt < 2) {
+        try {
+          await account.tokens.forceRefresh()
+          continue
+        } catch (refreshErr) {
+          // Refresh genuinely failed (invalid_grant etc.) -- this identity is
+          // dead until a human re-logs in via the agy CLI / dsh-agy-link.
+          throw new AgyUpstreamError(`agy account ${account.id}: refresh dead: ${refreshErr.message}`, {
+            status: 401,
+            code: 'DEAD_REFRESH',
+          })
+        }
+      }
+      if (!res.ok) {
+        const text = await res.text().catch(() => '')
+        throw new AgyUpstreamError(`agy account ${account.id} HTTP ${res.status}: ${text.slice(0, 200)}`, {
+          status: res.status,
+          code: res.status === 429 ? 'RESOURCE_EXHAUSTED' : `HTTP_${res.status}`,
+        })
+      }
+
+      yield* this.#consumeStream(res)
+      return
+    }
+  }
+
+  async *#completeSingle(body) {
     let attempt = 0
     // 401 retry loop: at most 2 tries (fresh token, then give up).
     for (;;) {

@@ -38,10 +38,23 @@ export class AgyTokenStore {
   #allowKeyring
   #current = null // { access_token, refresh_token, expiryMs }
 
-  constructor({ tokenFile = DEFAULT_FILE, cacheFile, allowKeyring = true } = {}) {
-    this.#tokenFile = tokenFile
-    this.#cacheFile = cacheFile ?? path.join(os.homedir(), '.dsh-gemini-bridge', 'agy-token-cache.json')
-    this.#allowKeyring = allowKeyring
+  constructor({ tokenFile = DEFAULT_FILE, cacheFile, allowKeyring = true, poolAccount = null } = {}) {
+    // poolAccount: { id, dir } from ~/.dsh/agy-accounts/pool.json. When set,
+    // the token file resolves inside that account's isolated HOME and the
+    // refresh cache lands next to OUR state (never inside the account dir,
+    // which dsh-agy-link owns and treats as agy's native state).
+    if (poolAccount && typeof poolAccount === 'object') {
+      this.#tokenFile = poolAccount.systemHome
+        ? DEFAULT_FILE
+        : path.join(poolAccount.dir, '.gemini', 'antigravity-cli', 'antigravity-oauth-token')
+      this.#cacheFile = cacheFile ?? path.join(
+        os.tmpdir(), 'dsh-gemini-bridge', `agy-cache-${poolAccount.id}.json`,
+      )
+    } else {
+      this.#tokenFile = tokenFile ?? DEFAULT_FILE
+      this.#cacheFile = cacheFile ?? path.join(os.homedir(), '.dsh-gemini-bridge', 'agy-token-cache.json')
+    }
+    this.#allowKeyring = allowKeyring && !(poolAccount && !poolAccount.systemHome)
   }
 
   /** Every readable source's blob, freshest-guess first (cache → file → keyring). */
@@ -177,12 +190,157 @@ export class AgyTokenStore {
   }
 
   describe() {
-    const src = this.#current?.source ?? null
+    // Read sources directly: status must be honest even before the first
+    // accessToken() call has populated #current (dashboard loads early).
+    const src = this.#current ?? this.#readSource()
+    const source = src?.source
     return {
-      loaded: Boolean(this.#current?.access_token),
-      source: typeof src === 'string' && src.startsWith('keyring') ? 'keyring:gemini:antigravity' : src,
-      expiry: this.#current?.expiryMs ? new Date(this.#current.expiryMs).toISOString() : null,
+      loaded: Boolean(src?.access_token),
+      source: typeof source === 'string' && source.startsWith('keyring') ? 'keyring:gemini:antigravity' : source ?? null,
+      expiry: src?.expiryMs
+        ? new Date(src.expiryMs).toISOString()
+        : (src?.expiry ? new Date(src.expiry).toISOString() : null),
     }
+  }
+}
+
+/**
+ * Multi-account agy credential pool, consuming the account pool that
+ * dsh-agy-link already maintains at ~/.dsh/agy-accounts/pool.json.
+ *
+ * Why consume rather than rebuild: that plugin owns the Windows credential
+ * slot (`gemini:antigravity`) with FIFO-mutex lease semantics, spawns agy
+ * children with per-account HOME isolation, and records per-family cooldowns
+ * and quota fractions in pool.json. A second writer on those files would race
+ * its scheduler. So this pool is a READ-ONLY consumer:
+ *   - accounts      = pool.json accounts[] filtered to enabled
+ *   - token files   = each account dir's antigravity-oauth-token
+ *                     (acc_primary -> system HOME / keyring, like the plugin)
+ *   - our writes    = ONLY our own per-account refresh caches (os.tmpdir)
+ *   - cooldowns     = tracked in OUR state (pool.json is never written by us)
+ *
+ * Rotation policy is the bridge's own (simple and aligned with detect.mjs):
+ *   sticky-until-failure: stay on the current account until it trips a
+ *   hard signal (429 quota / 401 dead), then park it (pauseFor) and move to
+ *   the next enabled account; all parked -> AgyAllParkedError.
+ */
+export class AgyPool {
+  #accounts = []   // [{ id, alias, email, systemHome, tokens: AgyTokenStore, pausedUntil, pauseReason }]
+  #cursor = 0
+  #poolFile
+
+  constructor({ config, AgyTokenStoreCtor = AgyTokenStore } = {}) {
+    this.#poolFile = config.agy?.poolFile
+      ?? path.join(os.homedir(), '.dsh', 'agy-accounts', 'pool.json')
+
+    const entries = this.#readPoolAccounts()
+    for (const entry of entries) {
+      this.#accounts.push({
+        id: entry.id,
+        alias: entry.alias ?? entry.id,
+        email: entry.email ?? null,
+        systemHome: Boolean(entry.systemHome),
+        tokens: new AgyTokenStoreCtor({ poolAccount: entry }),
+        pausedUntil: 0,
+        pauseReason: null,
+      })
+    }
+  }
+
+  /** Enabled accounts from pool.json; missing/corrupt file -> empty pool. */
+  #readPoolAccounts() {
+    try {
+      const pool = JSON.parse(fs.readFileSync(this.#poolFile, 'utf8'))
+      return (Array.isArray(pool?.accounts) ? pool.accounts : [])
+        .filter(a => a && a.enabled !== false && (a.dir || a.systemHome))
+    } catch {
+      return []
+    }
+  }
+
+  get count() { return this.#accounts.length }
+
+  describeAll() {
+    const now = Date.now()
+    return this.#accounts.map(a => ({
+      id: a.id,
+      alias: a.alias,
+      email: a.email,
+      systemHome: a.systemHome,
+      token: a.tokens.describe(),
+      pausedUntil: a.pausedUntil > now ? a.pausedUntil : null,
+      pauseReason: a.pauseReason,
+    }))
+  }
+
+  /** Next usable account: sticky cursor round-robin, skipping parked. */
+  pick() {
+    const now = Date.now()
+    if (this.#accounts.length === 0) return null
+    for (let i = 0; i < this.#accounts.length; i++) {
+      const candidate = this.#accounts[(this.#cursor + i) % this.#accounts.length]
+      if (candidate.pausedUntil > now) continue
+      this.#cursor = (this.#accounts.indexOf(candidate) + 1) % this.#accounts.length
+      return candidate
+    }
+    return null
+  }
+
+  nextUnpauseInMs() {
+    const now = Date.now()
+    const waits = this.#accounts
+      .filter(a => a.pausedUntil > now)
+      .map(a => a.pausedUntil - now)
+    return waits.length ? Math.min(...waits) : 0
+  }
+
+  /** Park one account after a hard-stop signal. */
+  pause(account, ms, reason) {
+    account.pausedUntil = Date.now() + ms
+    account.pauseReason = reason
+  }
+
+  /** Recovered-by-human or self-healed: clear the park. */
+  resume(id) {
+    const account = this.#accounts.find(a => a.id === id)
+    if (!account) return false
+    account.pausedUntil = 0
+    account.pauseReason = null
+    return true
+  }
+
+  /** Reload pool.json: picks up accounts added/removed by dsh-agy-link. */
+  reload() {
+    const before = new Set(this.#accounts.map(a => a.id))
+    const entries = this.#readPoolAccounts()
+    // Replace entries wholesale but PRESERVE pause state for surviving ids
+    // (a park is information about upstream behaviour, not about the file).
+    const pausedById = new Map(this.#accounts
+      .filter(a => a.pausedUntil > 0)
+      .map(a => [a.id, { pausedUntil: a.pausedUntil, pauseReason: a.pauseReason }]))
+    this.#accounts = entries.map(entry => ({
+      id: entry.id,
+      alias: entry.alias ?? entry.id,
+      email: entry.email ?? null,
+      systemHome: Boolean(entry.systemHome),
+      // Reuse the existing store for surviving accounts so their in-memory
+      // access token (already refreshed) is not dropped.
+      tokens: before.has(entry.id)
+        ? this.#accounts.find(a => a.id === entry.id).tokens
+        : new AgyTokenStore({ poolAccount: entry }),
+      pausedUntil: pausedById.get(entry.id)?.pausedUntil ?? 0,
+      pauseReason: pausedById.get(entry.id)?.pauseReason ?? null,
+    }))
+    if (this.#cursor >= this.#accounts.length) this.#cursor = 0
+    return { before: before.size, after: this.#accounts.length }
+  }
+}
+
+export class AgyAllParkedError extends Error {
+  constructor(msRemaining) {
+    super(`all agy accounts parked; soonest release in ${Math.ceil(msRemaining / 60000)} min`)
+    this.name = 'AgyAllParkedError'
+    this.retryAfterMs = msRemaining
   }
 }
 
@@ -206,7 +364,15 @@ function loadKeyringBindings() {
   // PowerShell with the P/Invoke reader and capture stdout per call. The value
   // passes through stdout as one line; callers JSON-parse it. Kept deliberately
   // small so the token never lands in a file or log of ours.
-  const script = [
+  //
+  // Invocation notes (both verified on this machine):
+  //   - `-Command script target` does NOT bind target to $args; PowerShell
+  //     parses it as trailing script text -> ParserError.
+  //   - `-File -` with argv works, but on a miss it echoes the script itself
+  //     back on stdout -> false positives.
+  // So: inline the (hardcoded, trusted) target via JSON.stringify quoting and
+  // run one self-contained -Command. A miss prints nothing -> null.
+  const readerScript = target => [
     'Add-Type -TypeDefinition @"',
     'using System; using System.Runtime.InteropServices;',
     'public static class C {',
@@ -217,17 +383,20 @@ function loadKeyringBindings() {
     '  public static string R(string t){ IntPtr p; if(!CredRead(t,1,0,out p)) return null; try{ CR c=(CR)Marshal.PtrToStructure(p,typeof(CR)); byte[] b=new byte[c.CredentialBlobSize]; Marshal.Copy(c.CredentialBlob,b,0,b.Length); return System.Text.Encoding.UTF8.GetString(b);} finally{ CredFree(p);} }',
     '}',
     '"@',
-    '[C]::R($args[0])',
+    `$v = [C]::R(${JSON.stringify(target)}); if ($null -ne $v) { $v }`,
   ].join('\n')
   return {
     read(target) {
-      const out = execFileSync('powershell.exe', ['-NoProfile', '-Command', script, target], {
+      const out = execFileSync('powershell.exe', ['-NoProfile', '-Command', readerScript(target)], {
         encoding: 'utf8',
         windowsHide: true,
         timeout: 20000,
         maxBuffer: 1024 * 64,
       })
-      return out.trim() || null
+      const value = out.trim()
+      // Guard: never accept an echo of our own script back as a credential.
+      if (!value || value.includes('Add-Type -TypeDefinition')) return null
+      return value
     },
   }
 }

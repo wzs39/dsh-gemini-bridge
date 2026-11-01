@@ -19,7 +19,7 @@
 import { loadConfig } from '../lib/config.mjs'
 import { AccountManager } from '../lib/manager.mjs'
 import { GeminiWebClient } from '../lib/client.mjs'
-import { AgyTokenStore } from '../lib/agytoken.mjs'
+import { AgyTokenStore, AgyPool } from '../lib/agytoken.mjs'
 import { AgyClient } from '../lib/agyclient.mjs'
 import { Router } from '../lib/router.mjs'
 import { createServer } from '../lib/server.mjs'
@@ -33,19 +33,27 @@ console.log('[serve] gemini-web-bridge starting ...')
 const manager = new AccountManager(config)
 const webClient = new GeminiWebClient({ config, manager })
 
-// ── agy channel (v1internal upstream, OAuth from this machine's agy login) ─
+// ── agy channel (v1internal upstream, OAuth from this machine) ─────────────
+// Multi-account first: when ~/.dsh/agy-accounts/pool.json exists (dsh-agy-link
+// maintains it), consume that pool -- per-account token files, sticky rotation,
+// per-account parks. Falls back to the single legacy token store otherwise.
 let agyClient = null
 if (config.agy?.enabled !== false) {
-  const tokens = new AgyTokenStore({ tokenFile: config.agy?.tokenFile })
-  agyClient = new AgyClient({ config, tokens })
-  // Probe the credential once at boot so /health can report honestly; a
-  // missing token does NOT kill the bridge, it just means no agy models.
-  try {
-    await tokens.accessToken()
-    console.log('[serve] ✓ agy channel: credential live, refresh pipeline ready')
-  } catch (e) {
-    agyClient = null
-    console.warn(`[serve] agy channel disabled: ${e.message} (run the agy CLI login once, or set agy.enabled=false)`)
+  const pool = new AgyPool({ config })
+  if (pool.count > 0) {
+    agyClient = new AgyClient({ config, pool })
+    const ready = pool.describeAll().filter(a => a.token.loaded).length
+    console.log(`[serve] ✓ agy pool: ${pool.count} account(s) from pool.json (${ready} token(s) readable)`)
+  } else {
+    const tokens = new AgyTokenStore({ tokenFile: config.agy?.tokenFile })
+    agyClient = new AgyClient({ config, tokens })
+    try {
+      await tokens.accessToken()
+      console.log('[serve] ✓ agy channel: single credential live, refresh pipeline ready')
+    } catch (e) {
+      agyClient = null
+      console.warn(`[serve] agy channel disabled: ${e.message} (no pool.json and no default agy token; set agy.enabled=false to silence)`)
+    }
   }
 }
 

@@ -20,9 +20,10 @@ function makeClient({ text = null, error = null } = {}) {
   const fakeAccount = { name: 'stub', guard: null, session: null, pausedUntil: 0, pauseReason: null }
   return {
     models: () => ['gemini-web'],
+    agyResume: () => false,
     describeAll: () => ({
       accounts: [{ name: 'stub', session: { ready: true }, guard: null, pausedUntil: null, pauseReason: null }],
-      agy: null,
+      agy: { enabled: true, models: [], token: { loaded: true } },
     }),
     manager: {
       describeAll: () => [{ name: 'stub', session: { ready: true }, guard: null, pausedUntil: null, pauseReason: null }],
@@ -86,6 +87,16 @@ describe('server happy path', () => {
     const data = await (await fetch(`${ctx.base}/health`)).json()
     assert.equal(data.status, 'ready')
     assert.equal(data.totalAccounts, 1)
+  })
+
+  it('GET /api/agy/pool reflects single-account mode as 404', async () => {
+    const r = await fetch(`${ctx.base}/api/agy/pool`)
+    assert.equal(r.status, 404)
+  })
+
+  it('POST /api/agy/resume without pool is 404', async () => {
+    const r = await fetch(`${ctx.base}/api/agy/resume?id=x`, { method: 'POST' })
+    assert.equal(r.status, 404)
   })
 
   it('POST /v1/chat/completions non-streaming', async () => {
