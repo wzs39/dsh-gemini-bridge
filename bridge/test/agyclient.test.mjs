@@ -238,3 +238,94 @@ describe('agy advertised model catalog', () => {
     assert.equal(new Set(AGY_MODELS).size, AGY_MODELS.length)
   })
 })
+
+describe('agy client — long output is not killed by a fixed deadline', () => {
+  /**
+   * Regression: the request used to carry AbortSignal.timeout(completionTimeoutMs)
+   * (120s). A healthy 1500-line generation was aborted mid-stream at ~40k chars
+   * with finishReason never arriving, which the user experienced as "always
+   * truncated". Liveness must be judged by silence, not by total duration.
+   */
+  it('a stream that keeps producing outlives the idle window', async () => {
+    // Emit frames with gaps SHORTER than the idle timeout, but for a total
+    // duration well beyond it. With a total-deadline design this fails.
+    const frames = 40
+    const body = new ReadableStream({
+      async start(controller) {
+        const enc = new TextEncoder()
+        for (let i = 0; i < frames; i++) {
+          controller.enqueue(enc.encode(`data: ${JSON.stringify({
+            response: { candidates: [{ content: { role: 'model', parts: [{ text: `L${i}\n` }] } }] },
+          })}\r\n\r\n`))
+          await new Promise(r => setTimeout(r, 25))
+        }
+        controller.close()
+      },
+    })
+
+    const restore = stubFetch(async () => new Response(body, {
+      status: 200, headers: { 'content-type': 'text/event-stream' },
+    }))
+    try {
+      const client = new AgyClient({
+        config: { agy: { project: 'p', defaultModel: 'gemini-3.8-flash-medium' }, behaviour: { streamIdleTimeoutMs: 120, completionTimeoutMs: 60000 } },
+        tokens: null,
+        pool: makePool(['a']),
+      })
+      const events = await collect(client.complete({
+        model: 'gemini-3.8-flash-medium',
+        messages: [{ role: 'user', content: 'go' }],
+      }))
+      const text = events.map(e => e.delta?.content ?? '').join('')
+      // 40 frames * 25ms = ~1000ms total, far beyond the 120ms IDLE window but
+      // every gap is under it -- so the whole answer must arrive.
+      assert.equal(text, Array.from({ length: frames }, (_, i) => `L${i}\n`).join(''))
+      assert.equal(events.at(-1).done, true)
+      assert.equal(events.at(-1).finishReason, 'stop')
+    } finally { restore() }
+  })
+
+  it('a truly stalled stream still aborts on the idle timeout', async () => {
+    // One frame, then silence. The stream is never closed, so the ONLY way out
+    // is the idle timer aborting the fetch signal.
+    //
+    // Note: the response body must react to the abort signal, otherwise the
+    // reader just hangs on a ReadableStream whose start() already returned --
+    // that hung this test suite the first time. We wire the abort through.
+    let aborted = false
+    const restore = stubFetch(async (url, opts) => {
+      const signal = opts?.signal
+      const body = new ReadableStream({
+        start(controller) {
+          const enc = new TextEncoder()
+          controller.enqueue(enc.encode(`data: ${JSON.stringify({
+            response: { candidates: [{ content: { role: 'model', parts: [{ text: 'partial' }] } }] },
+          })}\r\n\r\n`))
+          signal?.addEventListener('abort', () => {
+            aborted = true
+            try { controller.error(new Error('aborted')) } catch { /* already closed */ }
+          }, { once: true })
+        },
+      })
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    try {
+      const client = new AgyClient({
+        config: { agy: { project: 'p', defaultModel: 'gemini-3.8-flash-medium' }, behaviour: { streamIdleTimeoutMs: 150, completionTimeoutMs: 60000 } },
+        tokens: null,
+        pool: makePool(['a']),
+      })
+      const started = Date.now()
+      await assert.rejects(
+        () => collect(client.complete({
+          model: 'gemini-3.8-flash-medium',
+          messages: [{ role: 'user', content: 'go' }],
+        })),
+        'a stalled stream must abort rather than hang',
+      )
+      const elapsed = Date.now() - started
+      assert.ok(elapsed < 5000, `stall must abort promptly, took ${elapsed}ms`)
+      assert.equal(aborted, true, 'the idle timer must abort the underlying request')
+    } finally { restore() }
+  })
+})

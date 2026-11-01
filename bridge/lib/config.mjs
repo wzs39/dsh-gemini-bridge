@@ -35,7 +35,16 @@ const DEFAULTS = {
   },
   behaviour: {
     keepAliveSeconds: 900,
-    completionTimeoutMs: 120000,
+    // Total cap for one completion. Kept generous: this is a backstop against a
+    // hung socket, NOT a length limit. A fixed 120s used to kill long-but-healthy
+    // generations mid-stream (measured: a 1500-line answer was cut at 40530 chars
+    // with finishReason never arriving). Real liveness is judged by
+    // streamIdleTimeoutMs below.
+    completionTimeoutMs: 1800000,
+    // Abort only after this long with NO bytes from upstream. A long answer keeps
+    // resetting it, so generation length stops being a death sentence while a
+    // genuinely stalled stream still fails fast.
+    streamIdleTimeoutMs: 120000,
     tokenTtlMs: 3600000,
     emptyRetries: 1,
   },

@@ -32,7 +32,8 @@
   },
   "behaviour": {
     "keepAliveSeconds": 900,
-    "completionTimeoutMs": 120000,
+    "completionTimeoutMs": 1800000,
+    "streamIdleTimeoutMs": 120000,
     "tokenTtlMs": 3600000,
     "emptyRetries": 1
   },

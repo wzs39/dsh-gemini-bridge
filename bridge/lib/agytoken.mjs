@@ -26,11 +26,149 @@ import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 
 const DEFAULT_FILE = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'antigravity-oauth-token')
-
-/** OAuth client id/secret agy ships (installed-app class, from agyapi defaults). */
-const OAUTH_CLIENT_ID = '1071109997792-tfm8gGHsmnlq9u0bgnzqdc3q5gmf0q9k.apps.googleusercontent.com'
-const OAUTH_CLIENT_SECRET = 'REscO3o8l4TMQAmVCS6T9Iqn'
 const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token'
+
+/**
+ * OAuth client id/secret used to refresh an agy token.
+ *
+ * These are Google's own "installed app" credentials that the agy CLI ships as
+ * constants inside its binary. They are NOT committed to this repository: the
+ * values are extracted at runtime from the locally installed CLI, which also
+ * means they self-heal when Google rotates them (shipping a hard-coded pair is
+ * how this broke before -- the previous constants were retracted and the token
+ * endpoint answered `401 invalid_client / "The OAuth client was not found."`,
+ * silently killing every refresh once an access token aged out, which surfaced
+ * as mid-stream truncation rather than an auth error).
+ *
+ * Resolution order:
+ *   1. env AGY_OAUTH_CLIENT_ID + AGY_OAUTH_CLIENT_SECRET (explicit override)
+ *   2. extracted from the installed agy binary (cached per process)
+ *   3. give up with a clear error naming the missing piece
+ */
+const AGY_BIN_CANDIDATES = [
+  process.env.AGY_BIN,
+  path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local'), 'agy', 'bin', 'agy.exe'),
+  path.join(os.homedir(), '.local', 'bin', 'agy'),
+  '/usr/local/bin/agy',
+  '/opt/homebrew/bin/agy',
+].filter(Boolean)
+
+// Client ids are "NUM-hash.apps.googleusercontent.com" where the hash mixes
+// case (measured on agy 4.3.0: 884354919052-36trc1jjb3tguiac32ov6cod268c5blh…).
+// A lowercase-only class silently matches nothing, which looked exactly like
+// "the binary has no OAuth client".
+const CLIENT_ID_RE = /([0-9]{6,})-[A-Za-z0-9]{8,}\.apps\.googleusercontent\.com/g
+// Client secrets are "GOCSPX-" + exactly 28 chars = 35 total. Go stores string
+// constants back to back, so an open-ended {20,} swallows the following string
+// ("…ZtsXhttps://cloudcode-pa…" arrives as one 40-char match). No trailing
+// boundary assertion either: the next char is legitimately a word character
+// from the neighbouring constant.
+const CLIENT_SECRET_RE = /GOCSPX-[A-Za-z0-9_-]{28}/g
+
+let clientCache = null
+
+/** Read a file as latin-1 so binary bytes survive without decode errors. */
+function readBinaryText(file) {
+  return fs.readFileSync(file).toString('latin1')
+}
+
+/**
+ * Extract every client id / secret pair candidate from the agy binary.
+ *
+ * The pairing is not positional in a Go binary (string table order is not
+ * source order), so we return the two pools and let the caller probe which
+ * combination the token endpoint accepts. Probing is cached for the process and
+ * is the only reliable way to establish the mapping.
+ */
+function extractClientCandidates() {
+  const ids = new Set()
+  const secrets = new Set()
+  for (const bin of AGY_BIN_CANDIDATES) {
+    let text
+    try {
+      if (!fs.existsSync(bin)) continue
+      text = readBinaryText(bin)
+    } catch { continue }
+    for (const m of text.matchAll(CLIENT_ID_RE)) ids.add(m[0])
+    for (const m of text.matchAll(CLIENT_SECRET_RE)) secrets.add(m[0])
+  }
+  return { ids: [...ids], secrets: [...secrets] }
+}
+
+/**
+ * Resolve the OAuth client pair.
+ *
+ * Explicit env wins. Otherwise extract from the installed binary. When several
+ * candidates exist the caller-supplied `probe` decides (a single refresh attempt
+ * against a real refresh_token); without a probe we cannot guess safely, so we
+ * throw instead of silently using a pair that may be retracted.
+ */
+export async function resolveOAuthClient({ probe = null } = {}) {
+  if (process.env.AGY_OAUTH_CLIENT_ID && process.env.AGY_OAUTH_CLIENT_SECRET) {
+    return {
+      clientId: process.env.AGY_OAUTH_CLIENT_ID,
+      clientSecret: process.env.AGY_OAUTH_CLIENT_SECRET,
+      source: 'env',
+    }
+  }
+  if (clientCache) return clientCache
+
+  const { ids, secrets } = extractClientCandidates()
+  if (ids.length === 0) {
+    throw Object.assign(
+      new Error(
+        'agy OAuth client not found: install the agy CLI, or set '
+        + 'AGY_OAUTH_CLIENT_ID / AGY_OAUTH_CLIENT_SECRET',
+      ),
+      { code: 'NO_OAUTH_CLIENT' },
+    )
+  }
+  if (ids.length === 1 && secrets.length === 1) {
+    clientCache = { clientId: ids[0], clientSecret: secrets[0], source: 'binary' }
+    return clientCache
+  }
+  if (!probe) {
+    throw Object.assign(
+      new Error(
+        `agy binary carries ${ids.length} client id(s) and ${secrets.length} secret(s); `
+        + 'cannot pick one without a probe. Set AGY_OAUTH_CLIENT_ID / AGY_OAUTH_CLIENT_SECRET.',
+      ),
+      { code: 'AMBIGUOUS_OAUTH_CLIENT' },
+    )
+  }
+
+  // Probe each combination; first accepted pair wins and is cached.
+  for (const clientId of ids) {
+    for (const clientSecret of secrets) {
+      try {
+        if (await probe({ clientId, clientSecret })) {
+          clientCache = { clientId, clientSecret, source: 'binary-probed' }
+          return clientCache
+        }
+      } catch { /* try next */ }
+    }
+  }
+  throw Object.assign(
+    new Error('no client id/secret combination from the agy binary was accepted'),
+    { code: 'NO_VALID_OAUTH_CLIENT' },
+  )
+}
+
+/** Mutable holder so refresh paths can learn the pair lazily. */
+const oauthClient = { current: null }
+
+/** Best-effort synchronous view; null until resolveOAuthClient has run. */
+export function readOAuthClient() {
+  if (oauthClient.current) return oauthClient.current
+  if (process.env.AGY_OAUTH_CLIENT_ID && process.env.AGY_OAUTH_CLIENT_SECRET) {
+    return {
+      clientId: process.env.AGY_OAUTH_CLIENT_ID,
+      clientSecret: process.env.AGY_OAUTH_CLIENT_SECRET,
+      source: 'env',
+    }
+  }
+  return null
+}
 
 export class AgyTokenStore {
   #tokenFile
@@ -128,9 +266,36 @@ export class AgyTokenStore {
   }
 
   async #doRefresh(candidate) {
+    // Resolve the OAuth client lazily. Credentials are never hard-coded (a
+    // committed pair is what got retracted last time); the probe validates a
+    // candidate against THIS refresh_token, so the successful pair is proven
+    // usable before we commit to it.
+    const client = oauthClient.current ?? await resolveOAuthClient({
+      probe: async ({ clientId, clientSecret }) => {
+        const testBody = new URLSearchParams({
+          client_id: clientId,
+          client_secret: clientSecret,
+          refresh_token: candidate.refresh_token,
+          grant_type: 'refresh_token',
+        })
+        const r = await fetch(TOKEN_ENDPOINT, {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          body: testBody,
+          signal: AbortSignal.timeout(15000),
+        })
+        const j = await r.json().catch(() => ({}))
+        // invalid_grant still proves the CLIENT is valid -- the client was
+        // accepted and the token was rejected. Only invalid_client /
+        // unauthorized_client mean the pair is wrong.
+        return r.ok || (j.error !== 'invalid_client' && j.error !== 'unauthorized_client')
+      },
+    })
+    oauthClient.current = client
+
     const body = new URLSearchParams({
-      client_id: OAUTH_CLIENT_ID,
-      client_secret: OAUTH_CLIENT_SECRET,
+      client_id: client.clientId,
+      client_secret: client.clientSecret,
       refresh_token: candidate.refresh_token,
       grant_type: 'refresh_token',
     })

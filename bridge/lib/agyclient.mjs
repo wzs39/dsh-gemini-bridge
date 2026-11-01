@@ -168,24 +168,67 @@ export class AgyClient {
     }
   }
 
+  /**
+   * Long-lived request with an IDLE timeout instead of a total-duration one.
+   *
+   * A fixed AbortSignal.timeout(120s) cut healthy long generations mid-stream
+   * (measured: a 1500-line answer died at 40530 chars with no finishReason).
+   * Length is not the metric that matters -- silence is. `streamIdleTimeoutMs`
+   * re-arms on every chunk, so a long answer survives while a stalled socket
+   * still aborts quickly; `completionTimeoutMs` stays as a generous outer bound.
+   */
+  #streamSignal() {
+    const idleMs = this.#config.behaviour?.streamIdleTimeoutMs ?? 120000
+    const totalMs = this.#config.behaviour?.completionTimeoutMs ?? 1800000
+    const controller = new AbortController()
+    let idleTimer = null
+    const totalTimer = setTimeout(() => {
+      controller.abort(Object.assign(new Error('completion total timeout'), { code: 'TOTAL_TIMEOUT' }))
+    }, totalMs)
+    const armIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => {
+        controller.abort(Object.assign(new Error('stream idle timeout'), { code: 'IDLE_TIMEOUT' }))
+      }, idleMs)
+    }
+    armIdle()
+    return {
+      signal: controller.signal,
+      /** Call on every received chunk to keep the stream alive. */
+      touch: armIdle,
+      dispose() {
+        if (idleTimer) clearTimeout(idleTimer)
+        clearTimeout(totalTimer)
+      },
+    }
+  }
+
   async *#attemptWithAccount(account, body) {
     let attempt = 0
     for (;;) {
       attempt += 1
       const access = await account.tokens.accessToken()
-      const res = await fetch(`${BASE}/v1internal:streamGenerateContent?alt=sse`, {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${access}`,
-          'content-type': 'application/json',
-          requesttype: 'agent',
-          'user-agent': UA,
-        },
-        body,
-        signal: AbortSignal.timeout(this.#config.behaviour?.completionTimeoutMs ?? 120000),
-      })
+      const guard = this.#streamSignal()
+      let res
+      try {
+        res = await fetch(`${BASE}/v1internal:streamGenerateContent?alt=sse`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${access}`,
+            'content-type': 'application/json',
+            requesttype: 'agent',
+            'user-agent': UA,
+          },
+          body,
+          signal: guard.signal,
+        })
+      } catch (e) {
+        guard.dispose()
+        throw e
+      }
 
       if (res.status === 401 && attempt < 2) {
+        guard.dispose()
         try {
           await account.tokens.forceRefresh()
           continue
@@ -200,13 +243,18 @@ export class AgyClient {
       }
       if (!res.ok) {
         const text = await res.text().catch(() => '')
+        guard.dispose()
         throw new AgyUpstreamError(`agy account ${account.id} HTTP ${res.status}: ${text.slice(0, 200)}`, {
           status: res.status,
           code: res.status === 429 ? 'RESOURCE_EXHAUSTED' : `HTTP_${res.status}`,
         })
       }
 
-      yield* this.#consumeStream(res)
+      try {
+        yield* this.#consumeStream(res, guard)
+      } finally {
+        guard.dispose()
+      }
       return
     }
   }
@@ -246,7 +294,7 @@ export class AgyClient {
     }
   }
 
-  async *#consumeStream(res) {
+  async *#consumeStream(res, guard = null) {
     const decoder = new TextDecoder()
     // ONE reader for the whole body: getReader() locks the stream, and a
     // second call inside the loop would throw (or silently re-read nothing).
@@ -260,6 +308,9 @@ export class AgyClient {
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
+      // Any bytes from upstream count as liveness: re-arm the idle timer so a
+      // long-but-progressing answer is never mistaken for a stalled stream.
+      guard?.touch?.()
       buf += decoder.decode(value, { stream: true })
 
       // SSE frames end at a blank line. The upstream emits CRLF blank lines
