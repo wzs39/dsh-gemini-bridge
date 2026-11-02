@@ -3,6 +3,41 @@
 本项目的重要变更都记录在这里。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.1] - 2026-11-02
+
+产物面板里的图片和 PDF 无法预览。
+
+### 修复
+
+- **图片永远无法预览**。`readConversationFile` 把 png/jpg/gif/webp 和 zip/二进制
+  放进同一张名单，一律返回 `binary: true, content: ''`，抽屉只能显示一句
+  「二进制文件，不在浏览器里渲染」——字节从来没被送出去。现在图片回 base64
+  data URL（上限 8 MB：base64 膨胀约 4/3，而整个响应是一次性 JSON），
+  由前端 `<img>` 渲染；SVG 额外给出文本，但走 `<img>` 而不是 `innerHTML`。
+- **附件被记成「日志」且计数恒为 0**。附件实际落在
+  `.system_generated/logs/media/`，而 `classifyFile` 一进 `logs` 就
+  `return 'log'`，于是 `media` 统计永远是 0，PDF 在列表里显示成日志行。
+  现在 `media` 判定提前到 `logs` 的其它分支之前。
+- **PDF 无法内嵌**。Chrome 禁止 `<iframe src="data:application/pdf">`
+  （data URL 不能作为顶层导航），所以只有 JSON 路由时永远嵌不进去。新增
+  `…/agy/brain/raw` 回原始字节（正确的 MIME + `nosniff` +
+  `default-src 'none'` 的 CSP）。
+- **越权检查只有一份**。`raw` 路由复用 `resolveConversationFile`；两份实现
+  迟早会漂移，那时 raw 就成了绕过口。
+
+### 新增
+
+- 抽屉按类型渲染：图片 `<img>`、PDF `<iframe>`、文本 `<pre>`；抽屉头按类型给图标。
+- `bridge/tools/test-file-preview.mjs`：图片/PDF/文本三类 + 6 项越权拦截。
+- `bridge/tools/verify-preview-render.mjs`（`npm run test:render`）：用真实
+  Chromium 把图片画到 canvas 上**取样像素**、并检查 PDF iframe 拿到尺寸——
+  「返回 200」不算预览成功。
+- `test-brain-http.mjs` / `test-brain-routes.mjs` 补 raw 路由与分类回归。
+
+### 变更
+
+- `npm test` 现在包含 `test-file-preview.mjs`。
+
 ## [1.1.0] - 2026-11-02
 
 网页通道从「只有一个模型」变成真正可切换的四个模型。
