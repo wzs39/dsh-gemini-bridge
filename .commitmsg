@@ -1,7 +1,0 @@
-chore(release): v1.1.0
-
-Adds CHANGELOG.md, bumps the version, and documents the four switchable
-web modes in the README lead so the release page shows them up front.
-
-Also ignores commit-message scratch files (.commitmsg was picked up as an
-untracked file in the previous commit).
