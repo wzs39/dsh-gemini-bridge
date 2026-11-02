@@ -1,40 +1,7 @@
-feat(web): make the Gemini composer model switchable
+chore(release): v1.1.0
 
-The web channel had exactly one model because the model is not in the
-request. StreamGenerate never carries a model parameter -- the model is
-ACCOUNT STATE, owned by the composer mode button. A bridge that only POSTs
-StreamGenerate therefore always serves whatever mode the account happened to
-be left in, which is what "网页端没办法切换模型" actually was.
+Adds CHANGELOG.md, bumps the version, and documents the four switchable
+web modes in the README lead so the release page shows them up front.
 
-Four real models are now offered: gemini-web-flash-lite / -flash / -pro /
--argon. gemini-web stays the "follow the account" default and deliberately
-sends no switch RPC.
-
-The switch is batchexecute L5adhe: a sparse array whose ONLY meaningful index
-is 99 (the 16-hex model id), with the length repeated as the third element.
-f.sid is WIZ_global_data.FdrFJe and bl is cfb2h; swapping them still returns
-200, so a status code proves nothing.
-
-Three silent-failure traps are now covered by regression tests:
-
-- Pill parsing only understood fullwidth quotes, so an English UI returned the
-  whole aria-label, labelMatches never matched, and the switch RPC was re-sent
-  on every request while appearing to succeed.
-- labelMatches used plain substring containment, and "flash-lite" contains
-  "flash" -- the bridge would believe it had switched to Flash while the
-  account sat on Flash-Lite and never correct it.
-- Thread keys were prompt-only. A conversationId belongs to the account that
-  created it, so rotation handed pro1's id to pro2 and the upstream answered
-  200 with an empty body, indistinguishable from a degraded account.
-
-Also: gemini-3.5-flash-lite was listed as a web alias despite being a real agy
-model id, which routed agy traffic onto the web channel.
-
-How to tell the switch worked, since the obvious signals lie: the model name
-sometimes echoed in the response is a UI string unrelated to the mode, and
-answer length / latency / easy-question accuracy are identical across tiers.
-The toolchain is the discriminator -- on identical prompts Argon makes 2.2x the
-python calls and 2x the analysis-tool calls of Flash-Lite. Verify with
-bridge/tools/probe-toolchain.mjs, not with length.
-
-Tests: 158 pass (17 new in bridge/test/modes.test.mjs).
+Also ignores commit-message scratch files (.commitmsg was picked up as an
+untracked file in the previous commit).

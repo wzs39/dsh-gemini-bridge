@@ -15,3 +15,7 @@ bridge/tools/*.log
 # Local run artifacts (serve logs, captured streams, verification output).
 # runs/config.verify.json derives from config.json, which holds account config.
 runs/
+
+# Commit-message scratch files.
+.commitmsg
+.git-commit-msg.txt

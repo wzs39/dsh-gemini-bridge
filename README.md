@@ -4,14 +4,17 @@
 
 ```
 DSH 模型选择器
-  ├─ gemini/claude/gpt-oss 全家（agy 通道）→ Antigravity 上游 v1internal 直连
-  └─ gemini-web（网页通道）               → gemini.google.com 网页端（多账号轮转）
+  ├─ gemini-web-flash-lite / -flash / -pro / -argon（网页通道，可实时切模式）
+  ├─ gemini-web             （网页通道，跟随账号当前模式）
+  └─ gemini/claude/gpt-oss 全家（agy 通道）→ Antigravity 上游 v1internal 直连
             两者都汇聚到本地 bridge（127.0.0.1:18901，OpenAI 兼容）
 ```
 
 - **网页通道**：不拷 cookie 发请求——所有流量从真实登录的 Chromium（Chrome/Edge）
   页面内部发出，TLS/HTTP2/Client-Hints 指纹天然一致；Google 新版 DBSC 设备绑定
-  在这个形状下不构成任何障碍。
+  在这个形状下不构成任何障碍。**模型可切换**：Flash-Lite / Flash / Pro / Argon
+  四档，切换是账号状态（`L5adhe` RPC），详见
+  [网页端切换模型](#网页端切换模型gemini-web-)。
 - **agy 通道**：地区锁实测是**纯客户端闸门**（上游对 CN 归属账号的
   `streamGenerateContent` 正常返回 200）；插件直接复用本机 agy CLI 的 OAuth
   凭据走官方协议，解锁 `claude-sonnet-4-6`、`claude-opus-4-6-thinking`、
