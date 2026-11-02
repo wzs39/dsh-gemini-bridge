@@ -284,6 +284,13 @@ export function createServer(config, client) {
         return
       }
 
+      // A model switch the upstream did not honour is a degraded answer, not a
+      // refusal — but it must be visible, because "asked for Pro, served
+      // Flash-Lite" is exactly the bug class this route exists to expose.
+      if (opened.mode && opened.mode.ok === false) {
+        res.setHeader('x-gemini-mode-warning', `switch failed: ${opened.mode.error ?? 'unknown'}`)
+      }
+
       // Drain the channel into an OpenAI message. Both channels share the event
       // contract: { delta: {content?, reasoning_content?, tool_calls?},
       // finishReason?, usage?, done }. Streaming and non-streaming buffer the
@@ -373,6 +380,7 @@ export function createServer(config, client) {
       captureTurn(config, {
         channel: opened.channel,
         account: opened.account?.name ?? null,
+        mode: opened.mode ?? null,
         messages,
         response: fullText,
         toolCalls: emittedCalls.length,

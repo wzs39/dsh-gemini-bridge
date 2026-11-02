@@ -21,6 +21,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { attachFirstPage, launchBrowser, waitForDevTools, evaluate, sleep } from './cdp.mjs'
+import { READ_PILL_JS, setModeExpression, labelMatches, labelForHash } from './modes.mjs'
 
 /** Gemini endpoints */
 const APP_PATH = '/app'
@@ -31,6 +32,10 @@ export class Session {
   #credentials = null        // { cookies, snlm0e, bl, userAgent, harvestedAt }
   #pageTokens = null         // { snlm0e, bl, scrapedAt } – short-lived, refreshed per call
   #harvesting = null
+  /** Mode (16-hex id) we last successfully pushed to the account, if any. */
+  #appliedModeHash = null
+  /** Last pill label read from the page; exposed for /health. */
+  #pillLabel = null
   /** Attached CDP page session, kept alive so completions run inside it. */
   #page = null
   #browserChild = null
@@ -57,7 +62,98 @@ export class Session {
       ageSeconds: Math.round((Date.now() - harvestedAt) / 1000),
       pageTokenAge: tokenAge,
       blSample: this.#pageTokens?.bl?.slice(0, 30) ?? null,
+      // `mode` is what we actually PUSHED (authoritative for behaviour), while
+      // `pillLabel` is what the composer button still renders. They disagree
+      // after a switch until the page reloads, because the SPA does not repaint
+      // the button on an out-of-band RPC. Reporting only the pill would show a
+      // stale "Flash-Lite" for an account that is genuinely serving Pro.
+      mode: this.#appliedModeHash === null ? this.#pillLabel : (labelForHash(this.#appliedModeHash) ?? this.#pillLabel),
+      pillLabel: this.#pillLabel,
+      appliedModeHash: this.#appliedModeHash,
     }
+  }
+
+  /** Read the composer pill ("Pro" / "Flash-Lite" / …) from the live page. */
+  async readMode() {
+    await this.#ensurePage()
+    const label = await evaluate(this.#page, READ_PILL_JS).catch(() => null)
+    if (typeof label === 'string' && label !== '') this.#pillLabel = label
+    return this.#pillLabel
+  }
+
+  /**
+   * Put the account into a composer mode.
+   *
+   * The mode is ACCOUNT STATE, not a per-request parameter — that is the whole
+   * finding behind "网页端没办法切换模型".
+   *
+   * The pill CANNOT be the completion signal within one page session: after a
+   * successful L5adhe the server state changes but the SPA does not repaint the
+   * composer button until a reload (measured: ACK `[1]`, pill still "Flash-Lite",
+   * and after Page.navigate the pill reads "Pro"). So "pill does not match" is
+   * NOT proof the switch failed. Treating it as failure re-sent the RPC on every
+   * request, which is both wasteful and the exact burst shape we avoid.
+   *
+   * The completion signal is therefore: this session already pushed this hash
+   * (`#appliedModeHash`), or the RPC acknowledged it with `[1]`. The pill is
+   * reported for /health and only used to SKIP an unnecessary RPC when it agrees.
+   *
+   * @returns {Promise<{ok: boolean, wanted: string|null, pill: string|null,
+   *                    ack: string|null, changed: boolean}>}
+   */
+  async applyMode(mode, { thinkingLevel = null } = {}) {
+    const result = { ok: true, wanted: null, pill: null, ack: null, changed: false }
+    if (!mode || typeof mode.hash !== 'string' || mode.hash === '') return result  // "leave as-is"
+    result.wanted = mode.label
+
+    // Already pushed in this process and nothing external could have moved it.
+    if (this.#appliedModeHash === mode.hash) {
+      result.pill = this.#pillLabel
+      return result
+    }
+
+    await this.#ensurePage()
+    const pill = await this.readMode()
+    result.pill = pill
+    if (labelMatches(pill, mode.label)) {
+      // Read-back agrees: no RPC needed (first request after a restart usually
+      // lands here when the account was already on the wanted mode).
+      this.#appliedModeHash = mode.hash
+      return result
+    }
+
+    let raw
+    try {
+      raw = await evaluate(this.#page, setModeExpression(mode.hash, thinkingLevel))
+    } catch (error) {
+      result.ok = false
+      result.error = String(error?.message ?? error)
+      return result
+    }
+
+    let reply = null
+    try {
+      reply = typeof raw === 'string' ? JSON.parse(raw) : raw
+    } catch { /* non-JSON reply: treated as "no ack" below */ }
+
+    if (reply?.error) {
+      result.ok = false
+      result.error = reply.error
+      return result
+    }
+    result.ack = reply?.ack ?? null
+
+    // "[[]]" is the documented "rejected" ACK shape (unknown hash / not allowed);
+    // "[1]" is success. A 200 alone proves nothing either way.
+    if (typeof result.ack === 'string' && result.ack.replace(/\s/g, '') === '[[]]') {
+      result.ok = false
+      result.error = 'mode rejected by upstream'
+      return result
+    }
+
+    this.#appliedModeHash = mode.hash
+    result.changed = true
+    return result
   }
 
   /** True when the CSRF token is old enough that the next call should scrape fresh. */

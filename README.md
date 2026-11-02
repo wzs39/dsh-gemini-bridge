@@ -130,6 +130,67 @@ node bridge/tools/fix-validation.mjs <账号> --watch              # 自动等�
 轮转自检：`node bridge/tools/test-rotation.mjs`（park 掉当前账号 → 看流量是否
 切到另一个 → resume 后是否切回）。
 
+### 网页端切换模型（`gemini-web-*`）
+
+网页通道原来只有 `gemini-web` 一个模型，**因为模型不在请求体里**。
+`StreamGenerate` 从来不携带模型参数——模型是**账号状态**，由 composer 里那颗
+模式按钮（`button.input-area-switch`）决定。所以只发 StreamGenerate 的 bridge
+永远用账号上次留下的模式，这就是「网页端没办法切换模型」。
+
+现在提供四个真正可切的模型：
+
+| 模型 id | 模式 | 内部 16 位 id |
+|---|---|---|
+| `gemini-web` | 跟随账号当前模式（**不发切换 RPC**） | — |
+| `gemini-web-flash-lite` | Flash-Lite | `8c46e95b1a07cecc` |
+| `gemini-web-flash` | Flash | `56fdd199312815e2` |
+| `gemini-web-pro` | Pro | `e6fa609c3fa255c0` |
+| `gemini-web-argon` | Argon | `95a4c0abcba24364` |
+
+切换走 `batchexecute` 的 `L5adhe`：参数是一个稀疏数组，
+**只有 index 99 有意义**，值就是上表的 16 位 id；数组长度写在第三个元素
+（`[arr, null, [arr.length]]`）。`f.sid` 取 `WIZ_global_data.FdrFJe`，
+`bl` 取 `WIZ_global_data.cfb2h`——反过来传照样返回 200，所以**状态码不能当判据**。
+
+#### 三个会让这里出错、且都不会报错的点
+
+1. **Pill 文案解析**：中文界面是 `当前模式为“Pro”`（全角引号），英文界面是
+   `currently "Pro"`（ASCII 引号）。只匹配全角引号时，英文界面会把**整条
+   aria-label** 当成模式名，于是每次请求都判定“没切成功”并重发 RPC。
+   现在两种引号都认，并回退到按钮自身 `textContent`。
+2. **`labelMatches` 的子串陷阱**：`flash-lite` 包含 `flash`，所以朴素的
+   `includes` 会让「实际在 Flash-Lite、以为已切到 Flash」永远不被纠正——
+   静默错模型。现在先剥离版本号前缀，再要求剩余部分不出现别的档位词。
+3. **会话 id 跨账号/跨模式复用**：`conversationId` 属于创建它的那个 Google
+   账号。用内容做 threadKey 时，轮转到另一个账号会把 A 的 `c_…` 交给 B，
+   上游返回 **200 但正文为空**——和“账号被降级”长得一模一样。
+   threadKey 现在是 `account::modeHash::promptHash`。
+
+#### 怎么验证「切换真的生效」——不要用长度，不要用模型名
+
+两个看似合理、实际都会骗人的判据：
+
+- **响应里回显的模型名**：响应偶尔在动作建议区带一个 `"3.5 Flash-Lite"`，
+  它与账号当前模式无关，是 UI 字符串。拿它当 ground truth 会得出“切换无效”的错结论。
+- **输出长度 / 用时 / 简单题正确率**：实测三个模式在同一道 AIME 级题目上
+  答案完全一致（都对），长度中位数也几乎相同。
+
+真正能区分的判据是**工具链**：同一批需要“计算 + 检索”的中性题，按模式累计
+响应里的工具调用次数：
+
+| 模式 | `data_analysis_tool` | `python` | `google` |
+|---|---|---|---|
+| Flash-Lite | 6 | 34 | 198 |
+| Pro | 6 | 28 | 168 |
+| Argon | **12** | **74** | 204 |
+
+Argon 的 python 调用是 Flash-Lite 的 2.2 倍、分析工具 2 倍。工具能力是档位属性，
+这才是模式的指纹。复验：`node bridge/tools/probe-toolchain.mjs <account>`。
+
+一个必须知道的时序：**切换对“下一次”请求生效**。RPC 成功后 composer 按钮不会
+立即重绘，pill 可能还显示旧模式——那是显示延迟，不是切换失败。
+`/health` 里 `mode` 报的是**已推给账号的模式**，`pillLabel` 才是按钮当前渲染值。
+
 ## 安装
 
 ```bash

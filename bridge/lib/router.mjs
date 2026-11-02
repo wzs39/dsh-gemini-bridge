@@ -16,6 +16,7 @@
  */
 
 import { AGY_MODELS, AgyUpstreamError } from './agyclient.mjs'
+import { resolveWebMode, webModeIds, isWebMode } from './modes.mjs'
 
 const AGY_SET = new Set(AGY_MODELS)
 
@@ -33,10 +34,11 @@ export class Router {
   /** Exposed for the manager-facing health route compatibility. */
   get manager() { return this.#webClient?.manager ?? null }
 
-  /** Model list = web default + agy catalog (only when the channel actually works). */
+  /** Model list = web modes (only when the web channel exists) + agy catalog. */
   models() {
-    const out = [this.#config.server?.model ?? 'gemini-web']
+    const out = this.#webClient ? webModeIds() : []
     if (this.#agyClient) out.push(...AGY_MODELS)
+    if (out.length === 0) out.push(this.#config.server?.model ?? 'gemini-web')
     return out
   }
 
@@ -46,6 +48,10 @@ export class Router {
 
   channelFor(model) {
     if (this.#agyClient && AGY_SET.has(model)) return 'agy'
+    // Web modes win over agy: their ids/aliases are namespaced (gemini-web*),
+    // so an agy id can never collide, and an unknown id still falls through the
+    // old "forward unchanged, let upstream 404 honestly" path.
+    if (this.#webClient && isWebMode(model)) return 'web'
     if (this.#webClient && (!model || model === this.#config.server?.model)) return 'web'
     // Unknown model names: route to agy if it exists (upstream 404s honestly),
     // else web. Mirrors agyapi's "forward unknown names unchanged" behavior.
@@ -71,11 +77,18 @@ export class Router {
       return { channel, iterator: wrap(first, it) }
     }
 
-    const opened = await this.#webClient.openCompletion(payload.messages ?? [])
+    // Resolve the web mode here, where the requested id is still known: the
+    // client only needs the mode spec, not the routing decision.
+    const mode = resolveWebMode(model)
+    const opened = await this.#webClient.openCompletion({
+      messages: payload.messages ?? [],
+      mode: mode?.hash ? mode : null,
+    })
     // Web iterator is sync (events are already buffered); normalize shape.
     return {
       channel,
       account: opened.account,
+      mode: opened.mode ?? null,
       iterator: normalizeWeb(opened.iterator),
     }
   }

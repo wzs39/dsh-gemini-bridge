@@ -73,7 +73,9 @@ export class GeminiWebClient {
    * Throws GuardError/UpstreamError/AllParkedError on refusal, before any
    * response bytes exist.
    */
-  async openCompletion(messages) {
+  async openCompletion(payload) {
+    const messages = Array.isArray(payload) ? payload : (payload?.messages ?? [])
+    const mode = Array.isArray(payload) ? null : (payload?.mode ?? null)
     const release = await this.#acquire()
     try {
       const startedAt = Date.now()
@@ -103,8 +105,26 @@ export class GeminiWebClient {
         await session.harvest({ force: true })
       }
 
+      // Model selection lives in the composer pill, not in the payload — see
+      // modes.mjs. Applying it is account state, so a failed switch must NOT
+      // park the account: the request still runs, on whatever mode it was in.
+      let modeResult = null
+      if (mode) {
+        modeResult = await session.applyMode(mode).catch((error) => ({
+          ok: false, wanted: mode.label, error: String(error?.message ?? error),
+        }))
+      }
+
       const prompt = renderMessages(messages)
-      const threadKey = threadId(messages)
+      // Thread continuity is per (account, mode, prompt). Keying on the prompt
+      // alone is WRONG in a rotating pool: a conversationId belongs to the
+      // Google account that created it, so handing pro1's `c_…` to pro2 makes
+      // the upstream answer 200 with an empty body — indistinguishable from a
+      // degraded account, and measured as "upstream returned empty answer" on
+      // the first request after a mode switch (the pool had rotated).
+      // The mode is part of the key for the same reason: a thread started in
+      // Flash-Lite is not the same conversation as one in Pro.
+      const threadKey = `${account.name}::${mode?.hash ?? ''}::${threadId(messages)}`
       const thread = this.#threads.get(threadKey) ?? { conversationId: '', responseId: '', choiceId: '' }
 
       let raw
@@ -143,14 +163,21 @@ export class GeminiWebClient {
         // the account when the retry ALSO comes back empty. That makes
         // "two 200-with-nothing in a row" the real signal, which is what the
         // threshold of 4 was always meant to describe.
+        //
+        // The retry drops the conversationId when there was one: an empty answer
+        // on a continued thread means the thread itself is unusable (mode
+        // switched underneath it, or the id belongs to another identity), and
+        // resending the same dead id reproduces the same empty answer. A fresh
+        // thread costs nothing and isolates the real cause.
         const retries = this.#config.behaviour.emptyRetries ?? 1
         if (retries > 0) {
           await session.scrapePageTokens()
+          const fallbackThread = thread.conversationId ? { conversationId: '', responseId: '', choiceId: '' } : thread
           const raw2 = await session.generateRaw({
             prompt,
-            conversationId: thread.conversationId,
-            responseId: thread.responseId,
-            choiceId: thread.choiceId,
+            conversationId: fallbackThread.conversationId,
+            responseId: fallbackThread.responseId,
+            choiceId: fallbackThread.choiceId,
             timeoutMs: this.#config.behaviour.completionTimeoutMs,
           }).catch(() => null)
           if (raw2) {
@@ -174,7 +201,7 @@ export class GeminiWebClient {
       // The whole answer exists at this point (Gemini web delivers it complete).
       // Emit as one delta + done, mirroring the old generator interface.
       const events = [{ delta: parsed.text, done: false }, { delta: '', done: true }]
-      return { account, iterator: events[Symbol.iterator]() }
+      return { account, iterator: events[Symbol.iterator](), mode: modeResult }
     } finally {
       release()
     }
@@ -188,7 +215,10 @@ export class GeminiWebClient {
         choiceId: parsed.choiceId,
       })
     }
-    if (this.#threads.size > 50) {
+    // Keys now carry account+mode, so a pool of 3 accounts across 4 modes fills
+    // this faster than the old prompt-only scheme. Evict oldest first, but keep
+    // the map bounded regardless of how many identities are in play.
+    while (this.#threads.size > 200) {
       const oldest = this.#threads.keys().next().value
       this.#threads.delete(oldest)
     }

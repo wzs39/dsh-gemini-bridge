@@ -79,13 +79,46 @@ describe('Router channel selection', () => {
     assert.equal(webOnly.channelFor('mystery-model'), 'web')
   })
 
-  it('no web account but agy live -> agy models only on /v1/models', async () => {
+  it('web channel present -> web modes listed; none -> only configured default', async () => {
     const r = new Router({ config: CONFIG, webClient: stubWeb(), agyClient: stubAgy() })
     const names = r.models()
     assert.equal(names[0], 'gemini-web')
     assert.ok(names.includes('claude-sonnet-4-6'))
+    // 4 composer modes on top of the default id: the account can actually be
+    // switched now (see modes.mjs), so they must be offered.
+    for (const id of ['gemini-web-flash-lite', 'gemini-web-flash', 'gemini-web-pro', 'gemini-web-argon']) {
+      assert.ok(names.includes(id), `${id} should be listed`)
+    }
     const webOnly = new Router({ config: CONFIG, webClient: stubWeb(), agyClient: null })
-    assert.deepEqual(webOnly.models(), ['gemini-web'])
+    assert.deepEqual(webOnly.models(), [
+      'gemini-web', 'gemini-web-flash-lite', 'gemini-web-flash', 'gemini-web-pro', 'gemini-web-argon',
+    ])
+    // No web client at all -> do not advertise modes the account pool cannot serve.
+    const agyOnly = new Router({ config: CONFIG, webClient: null, agyClient: stubAgy() })
+    assert.ok(!agyOnly.models().some(id => id.startsWith('gemini-web-')))
+  })
+
+  it('web mode ids and their aliases all route to the web channel', async () => {
+    const r = new Router({ config: CONFIG, webClient: stubWeb(), agyClient: stubAgy() })
+    for (const id of ['gemini-web', 'gemini-web-pro', 'gemini-web-argon', 'pro', 'argon', 'flash-lite']) {
+      assert.equal(r.channelFor(id), 'web', `${id} should go to web`)
+    }
+    // An agy id must never be captured by the web branch.
+    assert.equal(r.channelFor('gemini-3.8-flash-medium'), 'agy')
+  })
+
+  it('web mode is passed through to the web client as a mode spec', async () => {
+    let seen = null
+    const web = stubWeb()
+    const original = web.openCompletion.bind(web)
+    web.openCompletion = (arg) => { seen = arg; return original(arg) }
+    const r = new Router({ config: CONFIG, webClient: web, agyClient: null })
+    await r.openCompletion({ model: 'gemini-web-pro', messages: [{ role: 'user', content: 'x' }] })
+    assert.equal(seen.mode.id, 'gemini-web-pro')
+    assert.equal(seen.mode.hash, 'e6fa609c3fa255c0')
+    // "follow the account" must NOT push a switch on every request.
+    await r.openCompletion({ model: 'gemini-web', messages: [{ role: 'user', content: 'x' }] })
+    assert.equal(seen.mode, null)
   })
 
   it('first-event pre-fetch means refusals throw before iteration', async () => {
