@@ -3,6 +3,19 @@
 本项目的重要变更都记录在这里。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.0] - 2026-11-02
+
+网页端反代回复中的图片（如 Matplotlib 图表、Imagen 生成图）在客户端显示“图片不可见 / 无法预览”。
+
+### 修复与新增
+
+- **网页端模型生成图内联解析（彻底解决图片不可见）**：
+  - **根因**：Gemini Web 在云端沙箱中执行 Python（如 Matplotlib 保存 `cycloid_arc.png`）或 Imagen 绘图时，返回的正文只包含 Google 内部占位符（如 `[http://googleusercontent.com/generated_image/...]`）和虚构的本地相对路径 `![...](cycloid_arc.png)`；真实的高清图片存储在 `https://lh3.googleusercontent.com/gg/...`，但带有会话级鉴权保护，普通客户端没有 Cookie 直接请求一律报 403 Forbidden。
+  - **解法**：在 `parser.mjs` 中从响应元数据（`inner[4][0][12]`）完整解析出图片 URL、文件名、MIME 类型与占位符映射；利用既有 CDP 通道在浏览器会话内调用 `Network.loadNetworkResource`，在毫秒级内完成原图下载并转换为 Base64 `data:image/...;base64,...` URL。
+  - **自动替换**：自动将文本中的所有 Google 内部占位符与虚构文件名 Markdown 图片标记替换为真实内联 Base64 Data URL，并在未显式引用时自动追加，使 DSH 的 Markdown 渲染器可以直接原生完整渲染图表，彻底解决“图片无法预览 / 403 / 找不到本地文件”的问题。
+- `bridge/test/parser.test.mjs`：增加图片提取与 Markdown 内联替换测试，覆盖 Matplotlib 图表、Imagen 画图与自动追加 3 类场景。
+- `bridge/tools/verify-web-image.mjs`：全链路端到端真机验证工具，测试流式与非流式下 Python 代码制图的下载与 Data URL 内联。
+
 ## [1.1.1] - 2026-11-02
 
 产物面板里的图片和 PDF 无法预览。

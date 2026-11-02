@@ -194,6 +194,14 @@ Argon 的 python 调用是 Flash-Lite 的 2.2 倍、分析工具 2 倍。工具�
 立即重绘，pill 可能还显示旧模式——那是显示延迟，不是切换失败。
 `/health` 里 `mode` 报的是**已推给账号的模式**，`pillLabel` 才是按钮当前渲染值。
 
+### 网页端回复图片内联（解决 Matplotlib / Imagen 等图片不可见）
+
+当 Gemini 网页端通过 Python 生成图表（如 `plt.savefig('cycloid_arc.png')`）或 Imagen 绘图时：
+- 上游返回的正文通常只有内部占位符（如 `[http://googleusercontent.com/generated_image/...]`）或虚构的本地相对路径（如 `![摆线](cycloid_arc.png)`）。
+- 真实的图像 URL 位于元数据中（`lh3.googleusercontent.com/gg/...`），但受 Google 登录态 Cookie 保护，外部客户端直接访问一律报 403 Forbidden。
+- 本插件在响应到达时，自动解析元数据中的图像信息，并在已保持登录的浏览器会话中通过 CDP `Network.loadNetworkResource` 毫秒级提取图像原始字节，转换为 Base64 `data:image/...;base64,...` URL，并自动替换 Markdown 中的占位符与虚构文件名。
+- DSH Markdown 渲染器因此能够直接原生无缝展示完整图表，无需依赖本地文件也不受鉴权阻断。
+
 ## 安装
 
 ```bash

@@ -21,7 +21,7 @@
  * @module gemini-web-bridge/lib/client
  */
 
-import { parseGenerateResponse } from './parser.mjs'
+import { parseGenerateResponse, replaceImagesInText } from './parser.mjs'
 
 /** An upstream error worth telling the guard about. */
 export class UpstreamError extends Error {
@@ -197,6 +197,21 @@ export class GeminiWebClient {
 
       guard.succeeded({ startedAt })
       this.#updateThread(threadKey, parsed)
+
+      // Resolve generated images (Matplotlib plots, Imagen, etc). Google web
+      // returns session-scoped placeholders in the text and authenticated
+      // googleusercontent URLs in metadata. The browser can fetch them via CDP,
+      // converting them into self-contained data URLs so DSH renders them inline.
+      if (Array.isArray(parsed.images) && parsed.images.length > 0) {
+        await Promise.all(parsed.images.map(async (img) => {
+          if (!img.url) return
+          const b64 = await session.downloadImageAsBase64(img.url).catch(() => null)
+          if (b64) {
+            img.dataUrl = `data:${img.mime || 'image/png'};base64,${b64}`
+          }
+        }))
+        parsed.text = replaceImagesInText(parsed.text, parsed.images)
+      }
 
       // The whole answer exists at this point (Gemini web delivers it complete).
       // Emit as one delta + done, mirroring the old generator interface.

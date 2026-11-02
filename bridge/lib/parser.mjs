@@ -60,12 +60,131 @@ export function parseGenerateResponse(raw) {
     : snapshots[snapshots.length - 1].text
 
   const meta = snapshots[snapshots.length - 1]
+  const images = extractImages(raw)
   return {
     text,
     conversationId: meta.conversationId,
     responseId: meta.responseId,
     choiceId: meta.choiceId,
+    images,
   }
+}
+
+/**
+ * Scan raw response for image metadata (Python generated plots, Imagen, etc).
+ * Returns array of { url, filename, mime, placeholder }.
+ */
+export function extractImages(raw) {
+  if (typeof raw !== 'string' || !raw.includes('googleusercontent.com')) return []
+  const images = []
+  const seenUrls = new Set()
+
+  function inspectArray(arr, ancestors) {
+    let url = null
+    let filename = null
+    let mime = 'image/png'
+
+    for (const item of arr) {
+      if (typeof item === 'string') {
+        if (/^https:\/\/[a-z0-9\-.]+\.googleusercontent\.com\/(gg|gg-dl)\//i.test(item)) {
+          url = item
+        } else if (/\.(png|jpe?g|webp|gif)$/i.test(item) && !item.includes('/')) {
+          filename = item
+        } else if (/^image\/(png|jpe?g|webp|gif)$/i.test(item)) {
+          mime = item
+        }
+      }
+    }
+
+    if (url && !seenUrls.has(url)) {
+      seenUrls.add(url)
+      let placeholder = null
+      for (const a of ancestors) {
+        if (!a) continue
+        const s = JSON.stringify(a)
+        const m = s.match(/\\?\[?https?:\/\/googleusercontent\.com\/[a-zA-Z0-9_\-\/]+\\?\]?/)
+        if (m) {
+          placeholder = m[0].replace(/\\/g, '')
+          break
+        }
+      }
+      images.push({ url, filename, mime, placeholder })
+    }
+  }
+
+  function walk(obj, ancestors = []) {
+    if (!obj || typeof obj !== 'object') return
+    const nextAncestors = [obj, ...ancestors.slice(0, 3)]
+    if (Array.isArray(obj)) {
+      inspectArray(obj, ancestors)
+      for (let i = 0; i < obj.length; i++) {
+        walk(obj[i], nextAncestors)
+      }
+    } else {
+      for (const k of Object.keys(obj)) {
+        walk(obj[k], nextAncestors)
+      }
+    }
+  }
+
+  for (const line of raw.split(/\r?\n/)) {
+    const t = line.trim()
+    if (!t.startsWith('[[')) continue
+    try {
+      const payload = JSON.parse(t)
+      for (const entry of payload) {
+        if (Array.isArray(entry) && entry[0] === 'wrb.fr' && typeof entry[2] === 'string') {
+          const inner = JSON.parse(entry[2])
+          walk(inner)
+        }
+      }
+    } catch {}
+  }
+
+  return images
+}
+
+/**
+ * Replace dead Google internal image placeholders and local file markdown tags
+ * with inline data URLs so DSH renders them immediately.
+ */
+export function replaceImagesInText(text, images) {
+  if (!text || !Array.isArray(images) || images.length === 0) return text
+  let out = text
+
+  for (const img of images) {
+    if (!img.dataUrl) continue
+
+    // 1. Replace explicit placeholder if known (e.g. [http://googleusercontent.com/generated_image/878])
+    if (img.placeholder) {
+      const bare = img.placeholder.replace(/^\[|\]$/g, '').trim()
+      if (bare) {
+        const escBare = bare.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        const re = new RegExp(`\\[?${escBare}\\]?`, 'g')
+        out = out.replace(re, `![${img.filename || 'image'}](${img.dataUrl})`)
+      }
+    }
+
+    // 2. Replace any markdown image targeting filename: ![alt](cycloid_arc.png)
+    if (img.filename) {
+      const escFn = img.filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const re = new RegExp(`!\\[([^\\]]*)\\]\\(${escFn}\\)`, 'g')
+      out = out.replace(re, `![$1](${img.dataUrl})`)
+    }
+
+    // 3. Fallback: replace any remaining googleusercontent placeholder
+    const genericRe = /\[?https?:\/\/googleusercontent\.com\/(?:generated_image|image_generation_content)\/[^\s\]\)\<\>]+\]?/g
+    if (genericRe.test(out)) {
+      out = out.replace(genericRe, `![${img.filename || 'image'}](${img.dataUrl})`)
+    }
+
+    // 4. If image dataUrl is still nowhere in the text, append it
+    if (!out.includes(img.dataUrl)) {
+      out += `\n\n![${img.filename || 'image'}](${img.dataUrl})\n`
+    }
+  }
+
+  return out
 }
 
 /**

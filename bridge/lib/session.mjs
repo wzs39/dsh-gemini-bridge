@@ -515,4 +515,43 @@ export class Session {
     }
     return raw?.text ?? ''
   }
+
+  /**
+   * Fetch an authenticated image URL from googleusercontent using the live browser session.
+   * Uses CDP Network.loadNetworkResource so TLS/cookies/auth are fully handled by Chromium.
+   * Returns raw base64 string, or null on failure.
+   */
+  async downloadImageAsBase64(url) {
+    if (!this.#page) return null
+    try {
+      await this.#page.send('Page.enable').catch(() => {})
+      await this.#page.send('Network.enable').catch(() => {})
+      const tree = await this.#page.send('Page.getResourceTree')
+      const frameId = tree?.frameTree?.frame?.id
+      if (!frameId) return null
+
+      const res = await this.#page.send('Network.loadNetworkResource', {
+        frameId,
+        url,
+        options: { disableCache: false, includeCredentials: true },
+      })
+
+      if (!res?.resource?.success || !res?.resource?.stream) return null
+
+      const stream = res.resource.stream
+      const chunks = []
+      try {
+        for (;;) {
+          const read = await this.#page.send('IO.read', { handle: stream })
+          if (read?.data) chunks.push(read.data)
+          if (read?.eof) break
+        }
+      } finally {
+        await this.#page.send('IO.close', { handle: stream }).catch(() => {})
+      }
+      return chunks.join('')
+    } catch {
+      return null
+    }
+  }
 }

@@ -15,7 +15,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { parseGenerateResponse } from '../lib/parser.mjs'
+import { parseGenerateResponse, extractImages, replaceImagesInText } from '../lib/parser.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const fixture = (name) => readFileSync(join(here, 'fixtures', name), 'utf8')
@@ -131,5 +131,75 @@ describe('parseGenerateResponse', () => {
     assert.ok(r.text.endsWith('40\n\nDONE.'), 'ends with DONE')
     assert.equal(r.text.match(/DONE/g).length, 1, 'no duplicated tail')
     assert.equal(r.conversationId, 'c_d3963fb903ed14ab')
+  })
+
+  // ── Image extraction and markdown inline replacement ─────────────────────
+  it('extractImages extracts image URLs, filenames, and placeholders from raw payloads', () => {
+    const mockInner = [
+      null, ['c_1', 'r_1'], null, null,
+      [
+        ['rc_1', ['Here is the plot:\n\n[http://googleusercontent.com/generated_image/123]\n\n![plot](plot.png)']],
+        null, null, null, null, null, null, null, null, null, null, null,
+        [
+          {
+            59: [
+              [
+                [
+                  '[http://googleusercontent.com/generated_image/123]',
+                  null,
+                  [null, 1, 'plot.png', 'https://lh3.googleusercontent.com/gg/mock_token', null, 'sig', null, null, null, null, null, 'image/png']
+                ]
+              ]
+            ]
+          }
+        ]
+      ]
+    ]
+    const raw = `)]}'\n\n100\n[["wrb.fr",null,${JSON.stringify(JSON.stringify(mockInner))}]]\n`
+    const images = extractImages(raw)
+    assert.equal(images.length, 1)
+    assert.equal(images[0].filename, 'plot.png')
+    assert.equal(images[0].mime, 'image/png')
+    assert.equal(images[0].url, 'https://lh3.googleusercontent.com/gg/mock_token')
+    assert.equal(images[0].placeholder, '[http://googleusercontent.com/generated_image/123]')
+  })
+
+  it('replaceImagesInText replaces placeholders and markdown filenames with dataUrl', () => {
+    const text = `
+Here is the curve:
+[http://googleusercontent.com/generated_image/878]
+
+### Visualization
+![摆线（旋轮线）几何形态](cycloid_arc.png)
+`
+    const images = [
+      {
+        url: 'https://lh3.googleusercontent.com/gg/...',
+        filename: 'cycloid_arc.png',
+        mime: 'image/png',
+        placeholder: '[http://googleusercontent.com/generated_image/878]',
+        dataUrl: 'data:image/png;base64,FAKE_DATA_123',
+      }
+    ]
+    const out = replaceImagesInText(text, images)
+    assert.ok(!out.includes('http://googleusercontent.com/generated_image/878'), 'placeholder must be gone')
+    assert.ok(!out.includes('(cycloid_arc.png)'), 'relative file reference must be replaced')
+    assert.ok(out.includes('![摆线（旋轮线）几何形态](data:image/png;base64,FAKE_DATA_123)'), 'markdown image must have dataUrl')
+    assert.ok(out.includes('![cycloid_arc.png](data:image/png;base64,FAKE_DATA_123)'), 'placeholder must be turned into inline image')
+  })
+
+  it('replaceImagesInText appends dataUrl if image is not referenced in text', () => {
+    const text = 'Here is your generated image.'
+    const images = [
+      {
+        url: 'https://lh3.googleusercontent.com/gg/...',
+        filename: 'cat.jpg',
+        mime: 'image/jpeg',
+        placeholder: null,
+        dataUrl: 'data:image/jpeg;base64,CAT_DATA',
+      }
+    ]
+    const out = replaceImagesInText(text, images)
+    assert.ok(out.includes('![cat.jpg](data:image/jpeg;base64,CAT_DATA)'))
   })
 })
