@@ -1,7 +1,7 @@
 // 端到端验证 agy-brain 的三条路由逻辑（不依赖 DSH 宿主，直接调 handler 里的函数）。
 // 目的：证明「面板能拿到真实数据」，而不是只证明「代码没语法错」。
 // agy-brain.js 在插件根目录的 lib/ 下（宿主半身），不在 bridge/lib/（网关本体）
-import { scanBrain, readConversation, readConversationFile, defaultAccountsRoot } from '../../lib/agy-brain.js'
+import { scanBrain, readConversation, readConversationFile, classifyFile, defaultAccountsRoot } from '../../lib/agy-brain.js'
 
 const log = (...a) => { process.stdout.write(a.join(' ') + '\n') }
 let failed = 0
@@ -46,7 +46,47 @@ if (art) {
   log('SKIP  该会话没有 md 产物')
 }
 
-// ── 4. 安全边界 ──
+// ── 4. 附件（media）必须被认出来 ──
+//
+// 回归：附件实际落在 `.system_generated/logs/media/…`，而 classifyFile 一进
+// logs 就 return 'log'，于是 media 计数永远是 0、附件在列表里显示成「日志」，
+// 用户看不出那是能预览的 PDF/图片。
+const MEDIA_CASES = [
+  ['.system_generated/logs/media/step_2_media_0.pdf', 'media'],
+  ['.system_generated/logs/media/shot.png', 'media'],
+  ['.system_generated/logs/transcript.jsonl', 'transcript'],
+  ['.system_generated/logs/chunks/transcript/00000000.jsonl', 'transcript-shard'],
+  ['.system_generated/steps/3/output.txt', 'tool-output'],
+  ['.system_generated/messages/1.json', 'message'],
+]
+for (const [rel, want] of MEDIA_CASES) {
+  const got = classifyFile(rel, 'conv-id')
+  check(`分类 ${rel.split('/').slice(-1)[0]} → ${want}`, got === want, `got=${got}`)
+}
+
+const mediaConv = idx.conversations.find(c => (c.media ?? 0) > 0)
+check('索引里有会话统计到 media', Boolean(mediaConv), '所有会话 media 都是 0')
+if (mediaConv) {
+  const md = readConversation(mediaConv.account, mediaConv.id)
+  const mediaFiles = (md.files ?? []).filter(f => f.kind === 'media')
+  check('附件文件被标成 media', mediaFiles.length > 0, `count=${mediaFiles.length}`)
+}
+
+// ── 5. 预览类型：图片给 dataUrl / PDF 给 raw URL / 文本给 content ──
+const previewConv = mediaConv ?? idx.conversations[0]
+const pv = readConversation(previewConv.account, previewConv.id)
+const pdfFile = (pv.files ?? []).find(f => f.rel.endsWith('.pdf'))
+if (pdfFile) {
+  const f = readConversationFile(previewConv.account, previewConv.id, pdfFile.rel)
+  check('PDF kind=pdf', f.kind === 'pdf', `kind=${f.kind}`)
+  check('PDF mime=application/pdf', f.mime === 'application/pdf', `mime=${f.mime}`)
+  check('PDF 给 streamUrl', typeof f.streamUrl === 'string' && f.streamUrl.includes('/brain/raw'))
+  check('PDF 不把 base64 塞进 JSON', !f.dataUrl)
+} else {
+  log('SKIP  没有 PDF 附件可测预览')
+}
+
+// ── 6. 安全边界 ──
 const bad = [
   ['路径穿越 ../', () => readConversationFile(first.account, first.id, '../../../etc/passwd')],
   ['绝对路径', () => readConversationFile(first.account, first.id, '/etc/passwd')],

@@ -273,15 +273,48 @@ bridge 的 agy 通道**自动切换为池模式**（无需配置）：
 
 无 pool.json 时回落到单账号模式（系统默认 agy 凭据），行为与之前一致。
 
+## agy 产物面板（侧边栏 🗂）
+
+把 agy 写在你机器上的东西摊开看，不用去翻 `~/.dsh/agy-accounts`：
+
+| 入口 | 位置 |
+|---|---|
+| 侧边栏图标 | 左侧轨道 🗂，点开是整块面板 |
+| composer 胶囊 | 输入框下方，随手开一个小窗 |
+
+面板分「文件 / 对话」两个标签，支持搜索标题与文件名。文件抽屉按类型渲染：
+
+| 类型 | 怎么预览 | 走什么 |
+|---|---|---|
+| 图片 png/jpg/gif/webp/avif/bmp/ico | `<img>` 直接画 | JSON 里带 base64 `dataUrl` |
+| SVG | `<img>` 画（不塞 innerHTML） | 文本 + data URL 都给 |
+| PDF | 浏览器内置阅读器，`<iframe>` 内嵌 | `…/agy/brain/raw` 原始字节 |
+| 文本 md/json/jsonl/txt/log | 等宽字体原文 | JSON 里带 `content` |
+| 其它二进制 | 只报大小与类型 | 不渲染 |
+
+> **踩过的坑**：早先图片和 PDF 都落在一张 binary 名单里，一律返回
+> `binary: true, content: ''`，抽屉只能显示一句「二进制文件，不在浏览器里渲染」
+> ——这就是「图片无法预览」的全部原因。顺带还有两个连带缺陷：
+> 附件实际在 `.system_generated/logs/media/`，而分类逻辑一进 `logs` 就
+> `return 'log'`，于是 `media` 计数永远是 0，PDF 在列表里显示成「日志」；
+> 以及 `<iframe src="data:application/pdf">` 被 Chrome 禁止，PDF 必须有真 URL
+> 才能内嵌，所以单独开了 `…/agy/brain/raw` 原始字节路由（同一个越权检查，
+> 不允许另写一份）。
+
+预览正确性不靠"返回 200"判断，`npm run test:render` 会用真实 Chromium 打开
+页面，把图片画到 canvas 上取样像素，并检查 PDF iframe 拿到了尺寸。
+
 ## 结构与已知边界
 
 ```
-lib/index.js          Host 半身：进程托管、配置 seed、provider 注册、usage 路由
+lib/index.js          Host 半身：进程托管、配置 seed、provider 注册、usage/brain 路由
+lib/agy-brain.js      agy 产物索引与文件读取（含类型判定与 raw 字节路由的越权检查）
 lib/openai-adapter.js DSH 词表 <-> OpenAI SSE（session-title 短路/闸门/透传拒绝）
-lib/client.js         浏览器半身：usage 卡片（含 agy 池逐账号状态行）
+lib/client.js         浏览器半身：usage 卡片 + 侧边栏产物面板（含图片/PDF 预览）
 bridge/               网关本体（Node ≥22，零第三方依赖，可脱离插件独立运行）
   lib/cdp.mjs         RFC 6455 帧解析（不要用数括号切 JSON，见复盘 §1）
   lib/parser.mjs      StreamGenerate 解析（累积快照语义，见复盘 §4）
+  lib/modes.mjs       网页端 composer 模式切换（L5adhe RPC 与 16 位模型 id）
   lib/guard.mjs       节奏/预算/熔断/异常分（档位化，availability() 供轮转查询）
   lib/manager.mjs     账号挑选（配额感知，不只看 park 状态）
 bridge/test/fixtures/ 真实上游响应，解析器回归依据
@@ -294,7 +327,8 @@ docs/                 第一手复盘
   本地改动恢复（标记跟账号走）。
 - 本工具降低封号概率，不免疫。上游风控是黑盒；转售/共享凭属最高执法优先级，
   请勿外发端点。
-- 改任何节奏参数后跑 `cd bridge && npm test`（132 用例）再部署。
+- 改任何节奏参数后跑 `npm test`（158 个单元测试 + 4 组契约/预览测试）再部署；
+  改了产物面板的渲染逻辑再跑 `npm run test:render`（真浏览器量像素）。
 
 ## License
 
